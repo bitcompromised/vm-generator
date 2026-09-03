@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { generate, buildImage, compile } = require('../src/generate');
 const { emitJs } = require('../src/emit-js');
+const { interpret } = require('../src/interp');
 
 let fengari = null;
 try { fengari = require('fengari'); } catch (_) { /* optional */ }
@@ -93,6 +94,56 @@ const cases = [
     src: 'let a = [3,1,2]; a = push(a, 9); print len(a); print a[3]; print str(a);',
     expect: ['4', '9', '[3, 1, 2, 9]'],
   },
+  {
+    name: 'for + break + continue',
+    src: 'let t=0; for(let i=0;i<10;i=i+1){ if(i==3){continue;} if(i==7){break;} t+=i; } print t;',
+    expect: ['18'],
+  },
+  {
+    name: 'compound assignment + increment',
+    src: 'let x=5; x*=3; x++; x-=1; print x;',
+    expect: ['15'],
+  },
+  {
+    name: 'ternary',
+    src: 'let y=4; print y>3?"big":"small"; print (y==0)?"z":str(y*2);',
+    expect: ['big', '8'],
+  },
+  {
+    name: 'js-subset input (function/const/console.log)',
+    src: 'function sq(n){ return n*n; } const k = 6; console.log("sq", sq(k));',
+    expect: ['sq 36'],
+  },
+  {
+    name: 'constant folding preserves value',
+    src: 'print 2 + 3 * 4; let a=10; let b=a*2+1; print b;',
+    expect: ['14', '21'],
+  },
+  {
+    name: 'objects + property access',
+    src: 'let o = {name:"vm", n:3}; print o.name; o.n = o.n + 1; print o["n"]; print len(o); print has(o,"name");',
+    expect: ['vm', '4', '2', 'true'],
+  },
+  {
+    name: 'closures (shared mutation, survives return)',
+    src: 'fn make(){ let c=0; return fn(){ c=c+1; return c; }; } let g=make(); print g(); print g(); fn adder(x){ return fn(y){ return x+y; }; } print adder(5)(10);',
+    expect: ['1', '2', '15'],
+  },
+  {
+    name: 'anonymous functions + call value + method',
+    src: 'let sq = fn(n){ return n*n; }; print sq(6); let o = {twice: fn(n){ return n*2; }}; print o.twice(21);',
+    expect: ['36', '42'],
+  },
+  {
+    name: 'exceptions (try/catch/finally)',
+    src: 'try { throw "boom"; print "no"; } catch(e){ print "caught " + e; } finally { print "done"; }',
+    expect: ['caught boom', 'done'],
+  },
+  {
+    name: 'selective virtualization annotations',
+    src: '@native\nfn a(x){ return x+1; }\n<@virtualize heavy>\nfn b(x){ return x*2; }\nprint a(4); print b(4);',
+    expect: ['5', '8'],
+  },
 ];
 
 console.log('== JS backend ==');
@@ -148,6 +199,116 @@ console.log('== determinism / moving target ==');
   const c = generate('print 42;', { target: 'js', banner: false, seed: 2 }).output;
   ok('same seed -> identical build', a === b);
   ok('different seed -> different build', a !== c);
+}
+
+console.log('== reference interpreter as oracle (interp == VM) ==');
+for (const c of cases) {
+  let vm, ref;
+  try { vm = runJs(c.src, 7); } catch (e) { vm = ['<throw> ' + e.message]; }
+  try { ref = interpret(compile(c.src, { optimize: true })).output; } catch (e) { ref = ['<throw> ' + e.message]; }
+  ok('oracle ' + c.name, JSON.stringify(vm) === JSON.stringify(ref), `vm=${JSON.stringify(vm)} ref=${JSON.stringify(ref)}`);
+}
+
+console.log('== optimizer is behavior-preserving (opt == no-opt) ==');
+for (const c of cases) {
+  const off = interpret(compile(c.src, { optimize: false })).output;
+  const on = interpret(compile(c.src, { optimize: true })).output;
+  ok('optimize ' + c.name, JSON.stringify(off) === JSON.stringify(on), `off=${JSON.stringify(off)} on=${JSON.stringify(on)}`);
+}
+
+console.log('== resource limits (controlled failure) ==');
+{
+  const src = 'fn r(n){ if(n<=0){return 0;} return r(n-1); } print r(1000);';
+  // no limit: runs fine
+  let unbounded;
+  try { unbounded = runJs(src, 3); } catch (e) { unbounded = ['<throw> ' + e.message]; }
+  ok('deep recursion runs without limits', JSON.stringify(unbounded) === JSON.stringify(['0']), `got ${JSON.stringify(unbounded)}`);
+  // with a small call-depth limit: rejected before completing
+  const limited = generate(src, { target: 'js', banner: false, seed: 3, maxDepth: 50 }).output;
+  let out = [], threw = false;
+  try { out = captureStdout(() => {
+    new Function('module', 'exports', 'require', 'process', 'console', 'Buffer', limited)(
+      { exports: {} }, {}, require, process, console, Buffer);
+  }); } catch (_) { threw = true; }
+  ok('call-depth limit trips', threw || JSON.stringify(out) !== JSON.stringify(['0']), `got ${JSON.stringify(out)}`);
+}
+
+console.log('== formalized header (format major/profile) ==');
+{
+  const { meta } = generate('print 1;', { target: 'js', seed: 1, profile: 'aggressive' });
+  ok('header reports format major 2', meta.major === 2);
+  ok('header records profile', meta.profile === 'aggressive');
+  // a build for an unknown profile is rejected
+  let threw = false;
+  try { generate('print 1;', { target: 'js', profile: 'nope' }); } catch (_) { threw = true; }
+  ok('unknown profile rejected', threw);
+}
+
+console.log('== modules / imports ==');
+{
+  const mods = {
+    'math.vgs': 'fn dbl(n){ return n*2; }',
+    'lib.vgs': 'import "math.vgs";\nfn quad(n){ return dbl(dbl(n)); }',
+  };
+  const resolveImport = (p) => (p in mods ? mods[p] : null);
+  const src = 'import "lib.vgs";\nimport "math.vgs";\nprint quad(3); print dbl(5);';
+  const out = interpret(compile(src, { resolveImport })).output;
+  ok('diamond import resolves once', JSON.stringify(out) === JSON.stringify(['12', '10']), `got ${JSON.stringify(out)}`);
+  let threw = false;
+  try { compile('import "math.vgs"; print 1;'); } catch (_) { threw = true; }
+  ok('import without resolver is rejected', threw);
+}
+
+console.log('== constant concealment (aggressive profile) ==');
+{
+  // integers are stored as xor-expressions; output must be unchanged.
+  const src = 'let x = 12345; let y = 678; print x + y; print 100 * 3;';
+  const out = captureStdout(() => {
+    const { output } = generate(src, { target: 'js', banner: false, seed: 3, profile: 'aggressive' });
+    new Function('module', 'exports', 'require', 'process', 'console', 'Buffer', output)(
+      { exports: {} }, {}, require, process, console, Buffer);
+  });
+  ok('concealed integers still compute', JSON.stringify(out) === JSON.stringify(['13023', '300']), `got ${JSON.stringify(out)}`);
+}
+
+console.log('== signing / entitlement (keyed MAC) ==');
+{
+  const src = 'print 1 + 1;';
+  const signed = generate(src, { target: 'js', banner: false, seed: 5, sign: 'secret-key' });
+  ok('signed build sets the signed flag', signed.meta.signed === true);
+  const runWithKey = (key) => {
+    const prev = process.env.VMGEN_KEY;
+    if (key === null) delete process.env.VMGEN_KEY; else process.env.VMGEN_KEY = key;
+    let out = [];
+    try { out = captureStdout(() => {
+      new Function('module', 'exports', 'require', 'process', 'console', 'Buffer', signed.output)(
+        { exports: {} }, {}, require, process, console, Buffer);
+    }); } catch (_) { /* controlled failure */ }
+    if (prev === undefined) delete process.env.VMGEN_KEY; else process.env.VMGEN_KEY = prev;
+    return out;
+  };
+  ok('runs with the correct key', JSON.stringify(runWithKey('secret-key')) === JSON.stringify(['2']));
+  ok('blocked with a wrong key', JSON.stringify(runWithKey('wrong')) !== JSON.stringify(['2']));
+  ok('blocked with no key', JSON.stringify(runWithKey(null)) !== JSON.stringify(['2']));
+}
+
+console.log('== multi-domain integrity (localized tamper) ==');
+{
+  const program = compile('let s = "secret"; fn g(){ return 42; } print s; print g();');
+  const { image } = buildImage(program, { seed: 5, conceal: true });
+  const runImg = (img) => {
+    let out = [], threw = false;
+    try { out = captureStdout(() => {
+      new Function('module', 'exports', 'require', 'process', 'console', 'Buffer', emitJs(img, { banner: false }))(
+        { exports: {} }, {}, require, process, console, Buffer);
+    }); } catch (_) { threw = true; }
+    return { out, threw };
+  };
+  // tamper a byte inside the function region (near the end of the body)
+  const t = image.slice();
+  t[image.length - 4] = (t[image.length - 4] ^ 0xff) & 0xff;
+  const r = runImg(t);
+  ok('function-region tamper rejected', r.threw || JSON.stringify(r.out) !== JSON.stringify(['secret', '42']));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

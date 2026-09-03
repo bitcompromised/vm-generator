@@ -49,29 +49,132 @@ function parse(src) {
     return { type: 'Block', body };
   }
 
+  // Map protection annotations to a per-function protection level:
+  //   @native -> 0 (no bytecode encryption), @weak -> 1, @medium/@virtualize -> 2,
+  //   @heavy -> 3. @virtualize <strength> uses the named strength.
+  function protLevelFromAnnots(annots) {
+    let level = 1; // default (weak)
+    for (const a of annots) {
+      const parts = a.split(/\s+/).filter(Boolean);
+      const head = parts[0];
+      if (head === 'native') level = 0;
+      else if (head === 'weak') level = 1;
+      else if (head === 'medium') level = 2;
+      else if (head === 'heavy') level = 3;
+      else if (head === 'virtualize') {
+        const s = parts[1];
+        level = s === 'weak' ? 1 : s === 'heavy' ? 3 : 2;
+      }
+    }
+    return level;
+  }
+
+  function attachAnnots(stmt, annots) {
+    if (!annots.length) return stmt;
+    const level = protLevelFromAnnots(annots);
+    if (stmt.type === 'FnDecl') stmt.protLevel = level;
+    else if (stmt.type === 'Let' && stmt.value && stmt.value.type === 'FnExpr') stmt.value.protLevel = level;
+    return stmt;
+  }
+
   function parseStatement() {
+    if (at('annot')) {
+      const annots = [];
+      while (at('annot')) annots.push(next().value);
+      return attachAnnots(parseStatement(), annots);
+    }
     const t = peek();
     if (t.type === 'let') return parseLet();
     if (t.type === 'fn') return parseFn();
     if (t.type === 'return') return parseReturn();
     if (t.type === 'if') return parseIf();
     if (t.type === 'while') return parseWhile();
+    if (t.type === 'for') return parseFor();
+    if (t.type === 'break') { eat('break'); eatOp(';'); return { type: 'Break' }; }
+    if (t.type === 'continue') { eat('continue'); eatOp(';'); return { type: 'Continue' }; }
+    if (t.type === 'try') return parseTry();
+    if (t.type === 'throw') { eat('throw'); const value = parseExpr(); eatOp(';'); return { type: 'Throw', value }; }
     if (t.type === 'print') return parsePrint();
     if (atOp('{')) return parseBlock();
 
-    // assignment or expression statement
+    const node = parseSimple();
+    eatOp(';');
+    return node;
+  }
+
+  // Compound-assignment operators lower to `target = target <op> rhs`.
+  const ASSIGN_OPS = {
+    '=': null, '+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%',
+    '&=': '&', '|=': '|', '^=': '^', '<<=': '<<', '>>=': '>>',
+  };
+
+  // Parse one "simple statement" (assignment, compound assignment,
+  // increment/decrement, or a bare expression) WITHOUT consuming a terminator.
+  // Shared by statements and by the init/update clauses of `for`.
+  function parseSimple() {
+    // prefix ++/--
+    if (atOp('++') || atOp('--')) {
+      const op = next().value === '++' ? '+' : '-';
+      const target = parseExpr();
+      return incDec(target, op);
+    }
     const expr = parseExpr();
-    if (atOp('=')) {
-      eatOp('=');
-      const value = parseExpr();
-      eatOp(';');
+    const t = peek();
+    if (t.type === 'op' && Object.prototype.hasOwnProperty.call(ASSIGN_OPS, t.value)) {
+      const aop = next().value;
+      const rhs = parseExpr();
+      const value = aop === '='
+        ? rhs
+        : { type: 'Binary', op: ASSIGN_OPS[aop], left: expr, right: rhs };
       return { type: 'Assign', target: expr, value };
     }
-    if (atOp('[')) {
-      // was handled inside parseExpr as index; fallthrough
+    // postfix ++/--
+    if (atOp('++') || atOp('--')) {
+      const op = next().value === '++' ? '+' : '-';
+      return incDec(expr, op);
     }
-    eatOp(';');
     return { type: 'ExprStmt', expr };
+  }
+
+  function incDec(target, op) {
+    return {
+      type: 'Assign',
+      target,
+      value: { type: 'Binary', op, left: target, right: { type: 'Num', value: 1 } },
+    };
+  }
+
+  function parseTry() {
+    eat('try');
+    const block = parseBlock();
+    let param = null;
+    let handler = null;
+    let finalizer = null;
+    if (at('catch')) {
+      eat('catch');
+      if (atOp('(')) { eatOp('('); param = eat('ident').value; eatOp(')'); }
+      handler = parseBlock();
+    }
+    if (at('finally')) { eat('finally'); finalizer = parseBlock(); }
+    if (!handler && !finalizer) throw new SyntaxError('try must have a catch or finally');
+    return { type: 'Try', block, param, handler, finalizer };
+  }
+
+  function parseFor() {
+    eat('for');
+    eatOp('(');
+    let init = null;
+    if (atOp(';')) { eatOp(';'); }
+    else if (at('let')) { init = parseLet(); } // parseLet consumes its own ';'
+    else { init = parseSimple(); eatOp(';'); }
+    let test = null;
+    if (!atOp(';')) test = parseExpr();
+    eatOp(';');
+    let update = null;
+    if (!atOp(')')) update = parseSimple();
+    eatOp(')');
+    const body = parseBlock();
+    return { type: 'For', init, test, update, body };
   }
 
   function parseLet() {
@@ -95,6 +198,22 @@ function parse(src) {
     eatOp(')');
     const body = parseBlock();
     return { type: 'FnDecl', name, params, body };
+  }
+
+  // Anonymous / named function expression: fn [name] (params) { body }.
+  function parseFnExpr() {
+    eat('fn');
+    let name = null;
+    if (at('ident')) name = next().value; // optional name (self-reference)
+    eatOp('(');
+    const params = [];
+    if (!atOp(')')) {
+      params.push(eat('ident').value);
+      while (atOp(',')) { eatOp(','); params.push(eat('ident').value); }
+    }
+    eatOp(')');
+    const body = parseBlock();
+    return { type: 'FnExpr', name, params, body };
   }
 
   function parseReturn() {
@@ -136,12 +255,27 @@ function parse(src) {
   }
 
   // ---- expressions ----
-  function parseExpr(minPrec = 0) {
+  // Grammar: expr -> ternary ; ternary -> binary ('?' expr ':' expr)? .
+  function parseExpr() { return parseTernary(); }
+
+  function parseTernary() {
+    const cond = parseBinary(0);
+    if (atOp('?')) {
+      eatOp('?');
+      const cons = parseExpr();        // then-branch may itself be a ternary
+      eatOp(':');
+      const alt = parseExpr();         // right-associative else-branch
+      return { type: 'Ternary', test: cond, cons, alt };
+    }
+    return cond;
+  }
+
+  function parseBinary(minPrec) {
     let left = parseUnary();
     while (atOp() && BINPREC[peek().value] !== undefined && BINPREC[peek().value] >= minPrec) {
       const op = next().value;
       const prec = BINPREC[op];
-      const right = parseExpr(prec + 1);
+      const right = parseBinary(prec + 1);
       left = { type: 'Binary', op, left, right };
     }
     return left;
@@ -172,6 +306,10 @@ function parse(src) {
         const index = parseExpr();
         eatOp(']');
         node = { type: 'Index', object: node, index };
+      } else if (atOp('.')) {
+        eatOp('.');
+        const property = eat('ident').value;
+        node = { type: 'Member', object: node, property };
       } else break;
     }
     return node;
@@ -196,6 +334,25 @@ function parse(src) {
       eatOp(']');
       return { type: 'Array', elements };
     }
+    // object / map literal: { key: expr, "k2": expr, ... }
+    if (atOp('{')) {
+      eatOp('{');
+      const props = [];
+      while (!atOp('}')) {
+        const kt = peek();
+        let key;
+        if (kt.type === 'str' || kt.type === 'ident') key = next().value;
+        else if (kt.type === 'num') key = String(next().value);
+        else throw new SyntaxError(`Expected property name but got '${kt.value}' at line ${kt.line}`);
+        eatOp(':');
+        props.push({ key, value: parseExpr() });
+        if (atOp(',')) eatOp(','); else break;
+      }
+      eatOp('}');
+      return { type: 'Object', props };
+    }
+    // anonymous function expression: fn (params) { body }  /  function (...) {...}
+    if (t.type === 'fn') return parseFnExpr();
     throw new SyntaxError(`Unexpected token '${t.value}' (${t.type}) at line ${t.line}`);
   }
 

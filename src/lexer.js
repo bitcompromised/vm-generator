@@ -2,13 +2,25 @@
 // Tokenizer for the vm-gen source language (.vgs).
 
 const KEYWORDS = new Set([
-  'let', 'fn', 'return', 'if', 'else', 'while', 'print', 'true', 'false', 'null',
+  'let', 'fn', 'return', 'if', 'else', 'while', 'for', 'break', 'continue',
+  'print', 'true', 'false', 'null',
+  'try', 'catch', 'finally', 'throw',
+  // .js-friendly aliases (see KW_ALIAS) so plain JavaScript in the supported
+  // subset can be used as input directly.
+  'function', 'const', 'var',
 ]);
 
-// Multi-char operators first so the longest match wins.
+// Keyword aliases: these lex to the token type of their canonical keyword so
+// the parser needs no special cases. Lets a `.js` file use `function`/`const`.
+const KW_ALIAS = { function: 'fn', const: 'let', var: 'let' };
+
+// Multi-char operators first so the longest match wins (the scan below returns
+// the first op that matches at the cursor, so 3-char must precede 2-char, etc).
 const OPS = [
-  '==', '!=', '<=', '>=', '&&', '||', '<<', '>>',
-  '+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|', '^',
+  '<<=', '>>=',
+  '==', '!=', '<=', '>=', '&&', '||', '<<', '>>', '++', '--',
+  '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
+  '+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|', '^', '?', ':', '.',
   '(', ')', '{', '}', '[', ']', ',', ';',
 ];
 
@@ -65,11 +77,31 @@ function lex(src) {
       continue;
     }
 
+    // protection annotations:  @name   or   <@ name strength >
+    if (c === '<' && src[i + 1] === '@') {
+      adv(2);
+      let content = '';
+      while (i < N && src[i] !== '>') { content += src[i]; adv(); }
+      adv(); // closing '>'
+      push('annot', content.trim());
+      continue;
+    }
+    if (c === '@') {
+      adv();
+      let s = '';
+      while (i < N && isIdentPart(src[i])) { s += src[i]; adv(); }
+      push('annot', s);
+      continue;
+    }
+
     // identifiers / keywords
     if (isIdentStart(c)) {
       let s = '';
       while (i < N && isIdentPart(src[i])) { s += src[i]; adv(); }
-      push(KEYWORDS.has(s) ? s : 'ident', s);
+      const kw = KEYWORDS.has(s) ? (KW_ALIAS[s] || s) : 'ident';
+      // keep the original spelling as the token value so error messages and
+      // `console`/`log` identifiers survive; only the *type* is canonicalized.
+      push(kw, s);
       continue;
     }
 
@@ -79,7 +111,6 @@ function lex(src) {
       if (src.startsWith(op, i)) { matched = op; break; }
     }
     if (matched) { push('op', matched); adv(matched.length); continue; }
-
     throw new SyntaxError(`Unexpected character '${c}' at line ${line}:${col}`);
   }
 

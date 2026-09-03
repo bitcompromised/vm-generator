@@ -49,9 +49,20 @@ const OPCODES = [
   ['RET',            []],
   ['CALL_HOST',      ['u16', 'u8']], // call host builtin named consts[idx]
   ['NEW_ARR',        ['u16']],   // pop N values -> array
-  ['ARR_GET',        []],        // arr[idx]
-  ['ARR_SET',        []],        // arr[idx] = val  (leaves val on stack)
+  ['ARR_GET',        []],        // arr[idx]  (also obj[key])
+  ['ARR_SET',        []],        // arr[idx] = val  (also obj[key] = val; leaves val)
   ['PRINT',          []],        // host print pop()
+  // ---- objects / maps (append-only; keeps canonical ids stable) ----
+  ['NEW_OBJ',        ['u16']],   // pop N (key,value) pairs -> object
+  // ---- first-class functions / closures ----
+  ['CLOSURE',        ['u16']],   // build a closure over functions[idx], capturing upvalues
+  ['LOAD_UP',        ['u16']],   // push upvalue[slot]
+  ['STORE_UP',       ['u16']],   // upvalue[slot] = pop()
+  ['CALL_VALUE',     ['u8']],    // call a closure value with argc args (callee below args)
+  // ---- exceptions ----
+  ['TRY',            ['u16']],   // install a catch handler at addr
+  ['END_TRY',        []],        // remove the top catch handler
+  ['THROW',          []],        // throw pop()
 ];
 
 const OP = {};

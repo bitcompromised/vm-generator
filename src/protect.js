@@ -15,6 +15,7 @@
 // through both to guarantee they stay in lock-step.
 
 const { OP_NAME, OP_OPERANDS } = require('./opcodes');
+const V = require('./version');
 
 const MASK32 = 0x100000000; // 2^32
 
@@ -36,6 +37,17 @@ function keystreamByte(state) {
 function fnSeed(codeSeed, fnIdx) {
   return (codeSeed + mul32(fnIdx, 2654435761)) % MASK32;
 }
+// Per-round key for a function's bytecode. Round 0 is exactly fnSeed so a single
+// round matches the historical single-pass cipher; further rounds use distinct
+// keystreams. XOR is self-inverse, so encrypting and decrypting are the same op.
+function roundSeed(codeSeed, fnIdx, r) {
+  return r === 0 ? fnSeed(codeSeed, fnIdx) : (fnSeed(codeSeed, fnIdx) + mul32(r, 2246822519)) % MASK32;
+}
+function encRounds(bytes, codeSeed, fnIdx, rounds) {
+  let out = bytes;
+  for (let r = 0; r < rounds; r++) out = cipher(out, roundSeed(codeSeed, fnIdx, r));
+  return out;
+}
 
 // XOR-encrypt/decrypt a byte array in place-style (returns new array).
 function cipher(bytes, seed) {
@@ -45,6 +57,17 @@ function cipher(bytes, seed) {
     st = lcgNext(st);
     out[i] = (bytes[i] ^ keystreamByte(st)) & 0xff;
   }
+  return out;
+}
+
+// Keyed 64-bit MAC over a byte array (obfuscation-grade authenticity, not a
+// cryptographic primitive): two FNV-1a passes with the key mixed in on both
+// sides. Returned as 8 bytes. The generated VMs compute this identically.
+function keyedMac(keyBytes, bytes) {
+  const m1 = fnv1a(keyBytes.concat(bytes));
+  const m2 = fnv1a(bytes.concat(keyBytes).concat([0x9e, 0x37, 0x79, 0xb9]));
+  const out = [];
+  w32(out, m1); w32(out, m2);
   return out;
 }
 
@@ -87,10 +110,18 @@ function encodeFunction(fn, perm) {
 }
 
 // ---- serialize the constant pool to a plain byte blob ----
-function serializeConsts(consts) {
+// tag 0 = number (decimal text), tag 1 = string (utf-8),
+// tag 2 = concealed non-negative integer stored as an *unsolved expression*
+//         A xor B where A is random -- the VM must compute A^B to recover it, so
+//         the literal value never appears even after the pool cipher is broken.
+function serializeConsts(consts, conceal, rng) {
   const blob = [];
   for (const c of consts) {
-    if (typeof c === 'number') {
+    if (conceal && typeof c === 'number' && Number.isInteger(c) && c >= 0 && c < 0x80000000) {
+      const A = rng() >>> 0;
+      const B = (c ^ A) >>> 0;
+      w8(blob, 2); w32(blob, A); w32(blob, B);
+    } else if (typeof c === 'number') {
       const s = Buffer.from(String(c), 'utf8');
       w8(blob, 0); w16(blob, s.length);
       for (const b of s) blob.push(b);
@@ -108,24 +139,30 @@ function buildImage(program, options = {}) {
   const rng = makeRng(options.seed !== undefined ? options.seed : (Date.now() >>> 0));
   const numCanon = OP_NAME.length;
 
-  // 1. random opcode permutation (distinct bytes)
+  // 1. random opcode permutation (distinct bytes). The shuffle always runs so
+  //    the RNG stream (and therefore codeSeed/constSeed) stays deterministic for
+  //    a given seed; the `development` profile then overrides perm to identity
+  //    so disassembly stays legible while the artifact is still encrypted.
   const pool = [];
   for (let i = 0; i < 256; i++) pool.push(i);
   for (let i = 255; i > 0; i--) { const j = rng() % (i + 1); const t = pool[i]; pool[i] = pool[j]; pool[j] = t; }
-  const perm = pool.slice(0, numCanon); // perm[canonId] = emitted byte
-
+  let perm = pool.slice(0, numCanon); // perm[canonId] = emitted byte
+  if (options.permute === false) { perm = []; for (let i = 0; i < numCanon; i++) perm.push(i); }
   const codeSeed = rng() % MASK32;
   const constSeed = rng() % MASK32;
 
-  // 2. encrypt constant pool
-  const constBlob = serializeConsts(program.consts);
+  // 2. encrypt constant pool (optionally concealing integers as expressions)
+  const constBlob = serializeConsts(program.consts, options.conceal === true, rng);
   const encConst = cipher(constBlob, constSeed);
 
   // 3. encode + encrypt each function
   const fnImages = program.functions.map((fn, idx) => {
     const plain = encodeFunction(fn, perm);
-    const enc = cipher(plain, fnSeed(codeSeed, idx));
-    return { name: fn.name, nparams: fn.nparams, nlocals: fn.nlocals, enc };
+    // selective virtualization: @native (0) leaves bytecode in the clear; higher
+    // levels apply more cipher rounds. Default 1 preserves the historical scheme.
+    const level = (fn.protLevel != null) ? fn.protLevel : 1;
+    const enc = encRounds(plain, codeSeed, idx, level);
+    return { name: fn.name, nparams: fn.nparams, nlocals: fn.nlocals, upvals: fn.upvals || [], protLevel: level, enc };
   });
 
   // ---- assemble body ----
@@ -144,24 +181,64 @@ function buildImage(program, options = {}) {
     for (const b of nameBytes) body.push(b);
     w8(body, f.nparams);
     w16(body, f.nlocals);
+    w8(body, f.upvals.length);
+    for (const u of f.upvals) { w8(body, u.fromLocal ? 1 : 0); w16(body, u.index); }
+    w8(body, f.protLevel);
     w32(body, f.enc.length);
     for (const b of f.enc) body.push(b);
   }
 
-  // 4. checksum over body
-  const checksum = fnv1a(body);
+  // ---- formalized header meta (bytes 2..6) ----
+  const profileName = options.profile || 'balanced';
+  if (!(profileName in V.PROFILES)) throw new Error(`unknown profile '${profileName}'`);
+  const archName = options.arch || 'stack-switch';
+  if (!(archName in V.ARCH)) throw new Error(`unknown architecture '${archName}'`);
+  const signed = typeof options.signKey === 'string' && options.signKey.length > 0;
+  let flags = 0;
+  if (options.optimized) flags |= V.FLAG_OPTIMIZED;
+  if (options.limited) flags |= V.FLAG_LIMITED;
+  if (signed) flags |= V.FLAG_SIGNED;
+  const metaBytes = [V.FORMAT_MAJOR, V.FORMAT_MINOR, flags, V.PROFILES[profileName], V.ARCH[archName]];
 
-  // ---- header + body ----
+  // 4. multiple independent integrity domains. Each covers a distinct region so
+  //    a tamper is localized to header / dispatch table / constants / functions;
+  //    the VM verifies each separately, plus a runtime self-check on load.
+  let fnAll = [];
+  for (const f of fnImages) fnAll = fnAll.concat(f.enc);
+  const dHeader = fnv1a(metaBytes);
+  const dDispatch = fnv1a(perm);
+  const dConst = fnv1a(encConst);
+  const dFn = fnv1a(fnAll);
+  const domainBytes = [];
+  w32(domainBytes, dHeader); w32(domainBytes, dDispatch); w32(domainBytes, dConst); w32(domainBytes, dFn);
+
+  // Optional keyed signature over the body (present only when FLAG_SIGNED).
+  let sigBytes = [];
+  if (signed) sigBytes = keyedMac(Array.from(Buffer.from(options.signKey, 'utf8')), body);
+
+  // The master checksum binds the header meta, the domain table, the optional
+  // signature and the body, so none of them can be altered without detection.
+  const checksum = fnv1a(metaBytes.concat(domainBytes).concat(sigBytes).concat(body));
+
+  // ---- assemble image: magic | meta(5) | u32 checksum | 4x u32 domains | [8B sig] | body ----
   const image = [];
-  w8(image, 0x56); // 'V'
-  w8(image, 0x47); // 'G'
-  w8(image, 1);    // version
+  w8(image, V.MAGIC0); // 'V'
+  w8(image, V.MAGIC1); // 'G'
+  for (const mb of metaBytes) w8(image, mb);
   w32(image, checksum);
+  for (const db of domainBytes) image.push(db);
+  for (const sb of sigBytes) image.push(sb);
   for (const b of body) image.push(b);
 
   return {
     image,
-    meta: { codeSeed, constSeed, perm, checksum, numFns: fnImages.length, imageSize: image.length },
+    meta: {
+      codeSeed, constSeed, perm, checksum,
+      major: V.FORMAT_MAJOR, minor: V.FORMAT_MINOR, flags,
+      profile: profileName, arch: archName, signed,
+      domains: { header: dHeader, dispatch: dDispatch, const: dConst, fn: dFn },
+      numFns: fnImages.length, imageSize: image.length,
+    },
   };
 }
 

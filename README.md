@@ -42,9 +42,11 @@ npm test
 
 ---
 
-## The source language (`.vgs`)
+## The source language (`.vgs` — or plain `.js`)
 
 A small C/JS-flavored language — enough to be interesting, small enough to read.
+The overlap with JavaScript is deliberate: a `.js` file written in the supported
+subset can be fed to `vm-gen` directly (see [`sample.js`](sample.js)).
 
 ```c
 // recursion, branching, loops
@@ -53,10 +55,8 @@ fn fib(n) {
   return fib(n - 1) + fib(n - 2);
 }
 
-let i = 0;
-while (i <= 10) {
+for (let i = 0; i <= 10; i++) {
   print "fib(" + str(i) + ") = " + str(fib(i));
-  i = i + 1;
 }
 ```
 
@@ -64,15 +64,28 @@ Supported:
 
 - **Values:** numbers, strings, booleans (`true`/`false`), `null`, arrays.
 - **Variables:** `let name = expr;`, reassignment `name = expr;` (block-scoped).
+  Compound assignment `+= -= *= /= %= &= |= ^= <<= >>=` and `++` / `--`.
 - **Operators:** `+ - * / %`, comparisons, `&& || !` (short-circuit),
-  bitwise `& | ^ << >>`.
-- **Control flow:** `if/else`, `while`.
-- **Functions:** top-level `fn` with parameters and recursion (no closures).
+  bitwise `& | ^ << >>`, ternary `cond ? a : b`.
+- **Control flow:** `if/else`, `while`, `for (init; test; update)`, `break`, `continue`.
+- **Functions:** top-level `fn` with parameters and recursion (no closures yet).
 - **Arrays:** `[a, b, c]`, indexing `a[i]`, assignment `a[i] = v`.
 - **`print expr;`** and host builtins:
   `len`, `str`, `num`, `floor`, `abs`, `rand`, `time`, `push`.
+- **`.js` aliases:** `function` → `fn`, `const`/`var` → `let`, and
+  `console.log(a, b, …)` lowers to `print` (arguments joined by spaces).
 
-See [`examples/`](examples/) for `hello.vgs`, `fib.vgs`, and `arrays.vgs`.
+See [`examples/`](examples/) for `hello.vgs`, `fib.vgs`, and `arrays.vgs`, and
+[`sample.js`](sample.js) for a plain-JavaScript input.
+
+### Compile-time optimization
+
+Every build except the `development` profile runs a **behavior-preserving**
+optimizer over the AST before codegen: constant folding (`2 + 3 * 4` → `14`),
+constant propagation of single-assignment `let`s, short-circuit/branch pruning,
+and dead-code elimination after `return`/`break`/`continue`. Protection never
+changes semantics — the test suite proves optimized and unoptimized builds print
+identical output, and both match the reference interpreter.
 
 ---
 
@@ -126,28 +139,46 @@ check deters casual patching, not an attacker who also regenerates the checksum.
 | [`src/lexer.js`](src/lexer.js) | Tokenizer for `.vgs`. |
 | [`src/parser.js`](src/parser.js) | Recursive-descent + precedence-climbing parser → AST. |
 | [`src/opcodes.js`](src/opcodes.js) | Canonical, language-agnostic opcode table (single source of truth). |
+| [`src/optimize.js`](src/optimize.js) | Behavior-preserving AST optimizer (folding, propagation, DCE). |
 | [`src/compiler.js`](src/compiler.js) | AST → per-function bytecode, scopes, jump backpatching. |
 | [`src/protect.js`](src/protect.js) | Opcode permutation, encryption, checksum → one opaque image. |
 | [`src/emit-js.js`](src/emit-js.js) | Standalone JS VM generator. |
 | [`src/emit-lua.js`](src/emit-lua.js) | Standalone Lua VM generator (pure Lua 5.1+, no libraries). |
+| [`src/interp.js`](src/interp.js) | Reference interpreter / behavioral oracle. |
 | [`src/disasm.js`](src/disasm.js) | Canonical (pre-protection) disassembler for debugging. |
+| [`src/version.js`](src/version.js) | Version numbers, image-header format, build profiles. |
+| [`src/benchmark.js`](src/benchmark.js) | Profiling / benchmarking. |
 | [`bin/vm-gen.js`](bin/vm-gen.js) | CLI. |
 | [`index.js`](index.js) | Programmatic API. |
 
 ### The image format
 
-A single byte array, embedded in the generated VM as base64:
+A single byte array, embedded in the generated VM as base64. The header is
+**formalized** (format 2) so future VM generations can coexist and be told apart:
 
 ```
-magic 'V''G' | version | u32 checksum
-└── body (checksummed) ──────────────────────────────────────────────┐
+magic 'V''G' | major | minor | flags | profile | arch | u32 checksum
+└── body (checksummed together with the header meta bytes) ──────────┐
     u32 codeSeed | u32 constSeed | u8 nOpcodes | perm[nOpcodes]       │
     u16 constCount | u32 encConstLen | encConst[…]                    │
     u16 fnCount | per fn: name, nparams, nlocals, u32 codeLen, enc[…] │
 ```
 
+- **major/minor** — image format version; a decoder refuses a `major` it doesn't know.
+- **flags** — bit 0 `optimized`, bit 1 `limited` (runtime resource limits present).
+- **profile** — the build profile (`development`/`balanced`/`aggressive`/`performance`).
+- **arch** — VM architecture id (reserved so register/threaded/block VMs can coexist).
+- **checksum** — FNV-1a over the header meta bytes **and** the body, so tampering
+  with either the header fields or the body is detected.
+
 The VM verifies the checksum, rebuilds the inverse opcode map, decrypts the
 constant pool and each function's code, then runs a stack-machine dispatch loop.
+
+### Versioning
+
+Four independent version numbers let a host reason about compatibility of each
+component separately (`vm-gen --version` prints them): compiler, VM ABI,
+bytecode, and protection scheme. See [`src/version.js`](src/version.js).
 
 ## Programmatic use
 
@@ -161,13 +192,87 @@ console.log(output);                 // standalone Lua source
 console.log(disassemble(compile(src))); // canonical bytecode listing
 ```
 
+## Build profiles
+
+`--profile` selects a bundle of build settings (explicit flags still override):
+
+| Profile | Optimize | Opcode perm. | Runtime limits | Use |
+|---------|:--------:|:------------:|----------------|-----|
+| `development` | off | identity | none | readable disasm, debugging |
+| `balanced` *(default)* | on | random | call-depth 1024 | ship-ready protection |
+| `aggressive` | on | random | depth 512, 2e8 instr | maximum hardening |
+| `performance` | on | random | none | speed over limits |
+
+```bash
+vm-gen build app.vgs --target js --profile aggressive --seed random
+```
+
+### Resource limits
+
+Builds can embed a runtime **instruction budget** (`--max-steps`) and
+**call-depth limit** (`--max-depth`) directly into the generated VM. When a limit
+is exceeded the VM fails in a controlled way (aborts with a diagnostic) instead of
+spinning or overflowing — the same mechanism the fuzzer relies on to bound
+malformed images. Both back-ends enforce them identically.
+
+## Tooling
+
+- **Reference interpreter** — `vm-gen exec <source>` runs the *canonical*
+  bytecode with no protection at all; `--trace` prints a per-step dump (opcode,
+  stack, locals). It is the behavioral **oracle** the test suite validates every
+  generated VM against. See [`src/interp.js`](src/interp.js).
+- **Benchmark** — `vm-gen benchmark <source>` reports compile time, artifact and
+  image size, startup+execution time, memory, instruction/dispatch/constant
+  counts. See [`src/benchmark.js`](src/benchmark.js).
+- **Fuzzer** — `npm run fuzz` throws malformed source and mutated images at the
+  lexer, parser, compiler and VM (truncation, corrupt lengths, bad opcodes/jumps,
+  stack underflow, recursion blow-ups) and asserts graceful failure + that no
+  tampered image ever reproduces clean output. See [`test/fuzz.js`](test/fuzz.js).
+- **Known-good artifacts** — `node test/known-good.js` compares a fixed build
+  matrix against golden hashes so any change to the serializer/protector output
+  is caught immediately; regenerate intentional changes with
+  `UPDATE_GOLDEN=1 node test/known-good.js`. Part of `npm test`.
+
 ## CLI reference
 
 ```
-vm-gen build  <source.vgs> [--target js|lua] [-o out] [--seed N] [--no-banner]
-vm-gen run    <source.vgs>            compile to JS in memory and execute
-vm-gen disasm <source.vgs>            print canonical bytecode
+vm-gen build     <source> [--target js|lua] [--profile P] [-o out] [--seed N]
+                          [--max-steps N] [--max-depth N] [--no-optimize] [--no-banner]
+vm-gen run       <source>             compile to JS in memory and execute
+vm-gen exec      <source> [--trace]   run on the reference interpreter (oracle)
+vm-gen disasm    <source>             print canonical bytecode (pre-protection)
+vm-gen benchmark <source> [--profile P]   profile compile/build/run metrics
+vm-gen --version                      print component versions
 ```
+
+`<source>` is a `.vgs` program or a `.js` file in the supported subset.
+
+## Implementation status
+
+Landed in this update:
+
+- **Language:** `.js` input, `for`/`break`/`continue`, ternary, compound
+  assignment, `++`/`--`, `console.log`.
+- **Optimizer:** constant folding, constant propagation, branch pruning,
+  dead-code elimination — all behavior-preserving and test-verified.
+- **Format:** formalized versioned header (major/minor/flags/profile/arch),
+  header-bound checksum, four component version numbers.
+- **Profiles:** `development` / `balanced` / `aggressive` / `performance`.
+- **Runtime:** embeddable instruction & call-depth limits with controlled failure.
+- **Tooling:** reference interpreter (oracle) + trace, benchmark command,
+  fuzzer, known-good artifact regression suite.
+
+Deliberately deferred (larger designs, not yet started — semantics-first, so
+they are added only when they can be done without breaking behavior):
+
+- Objects/maps, methods, exceptions (`try/catch/finally`), modules/imports,
+  anonymous functions, closures/upvalues.
+- Register VM and multi-architecture generation from a common VM definition;
+  instruction-set polymorphism, basic-block & control-flow virtualization.
+- Constant-pool concealment as unsolved expressions; multi-domain anti-tamper;
+  cryptographic signing / licensing / server-backed secrets.
+- Selective virtualization annotations (`@native` / `@virtualize` / strength).
+- Garbage-collection / runtime value-model choices.
 
 ## License
 

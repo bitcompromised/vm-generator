@@ -6,18 +6,51 @@ const { buildImage } = require('./protect');
 const { emitJs } = require('./emit-js');
 const { emitLua } = require('./emit-lua');
 const { disassemble } = require('./disasm');
+const V = require('./version');
+
+// Resolve a build profile into a concrete configuration. Explicit options always
+// override the profile's defaults, so `--profile performance --max-depth 100`
+// works as expected.
+function resolveConfig(options = {}) {
+  const profile = (options.profile || 'balanced').toLowerCase();
+  const base = V.PROFILE_CONFIG[profile];
+  if (!base) throw new Error(`unknown profile '${profile}' (expected ${V.PROFILE_NAMES.join(', ')})`);
+  const pick = (k) => (options[k] !== undefined ? options[k] : base[k]);
+  return {
+    profile,
+    optimize: pick('optimize'),
+    permute: pick('permute'),
+    conceal: pick('conceal'),
+    maxSteps: pick('maxSteps'),
+    maxDepth: pick('maxDepth'),
+    arch: options.arch || base.arch,
+  };
+}
 
 function generate(source, options = {}) {
   const target = (options.target || 'js').toLowerCase();
-  const program = compile(source);
-  const { image, meta } = buildImage(program, { seed: options.seed });
+  const cfg = resolveConfig(options);
+  const program = compile(source, { optimize: cfg.optimize, resolveImport: options.resolveImport });
+  const limited = cfg.maxSteps > 0 || cfg.maxDepth > 0;
 
+  const { image, meta } = buildImage(program, {
+    seed: options.seed,
+    profile: cfg.profile,
+    arch: cfg.arch,
+    optimized: cfg.optimize,
+    permute: cfg.permute,
+    conceal: cfg.conceal,
+    limited,
+    signKey: options.sign,
+  });
+
+  const emitOpts = Object.assign({}, options, { maxSteps: cfg.maxSteps, maxDepth: cfg.maxDepth });
   let out;
-  if (target === 'js' || target === 'javascript') out = emitJs(image, options);
-  else if (target === 'lua') out = emitLua(image, options);
+  if (target === 'js' || target === 'javascript') out = emitJs(image, emitOpts);
+  else if (target === 'lua') out = emitLua(image, emitOpts);
   else throw new Error(`Unknown target '${target}' (expected js or lua)`);
 
-  return { output: out, program, image, meta };
+  return { output: out, program, image, meta, config: cfg };
 }
 
-module.exports = { generate, compile, buildImage, disassemble };
+module.exports = { generate, compile, buildImage, disassemble, resolveConfig };
