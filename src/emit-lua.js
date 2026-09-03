@@ -29,9 +29,20 @@ local FORMAT_MAJOR = ${V.FORMAT_MAJOR}
 local EXPECTED_OPCOUNT = ${OP_NAME.length}
 local MAX_STEPS = ${maxSteps}
 local MAX_DEPTH = ${maxDepth}
+local SALT = ${(opts.salt >>> 0)}
 
 local MASK32 = 4294967296
 local floor = math.floor
+
+-- 32-bit xor (used to recover the hidden master seed from the stored value)
+local function bxor32(a, b)
+  local r, bit = 0, 1
+  for _ = 1, 32 do
+    if (a % 2) ~= (b % 2) then r = r + bit end
+    a = floor(a / 2); b = floor(b / 2); bit = bit * 2
+  end
+  return r
+end
 
 local function mul32(a, b)
   a = a % MASK32; b = b % MASK32
@@ -187,13 +198,23 @@ local function load()
   local function u16() local v = body[p] + body[p + 1] * 256; p = p + 2; return v end
   local function u32() local v = body[p] + body[p + 1] * 256 + body[p + 2] * 65536 + body[p + 3] * 16777216; p = p + 4; return v end
 
-  local codeSeed = u32(); local constSeed = u32()
+  -- Regenerate cipher seeds + opcode permutation from the hidden master seed
+  -- (none are stored in the image); mirrors the builder and emit-js exactly.
+  local obfMaster = u32()
+  local masterSeed = bxor32(obfMaster, SALT)
   local numCanon = u8()
-  -- runtime integrity: opcode table must match this VM build
   if numCanon ~= EXPECTED_OPCOUNT then error('integrity check failed: VM/opcode-table mismatch') end
+  local rs = masterSeed; if rs == 0 then rs = 2654435769 end
+  local function rng() rs = lcgNext(rs); return rs end
+  local pool = {}
+  for i = 0, 255 do pool[i] = i end
+  for j = 255, 1, -1 do local jj = rng() % (j + 1); local tt = pool[j]; pool[j] = pool[jj]; pool[jj] = tt end
+  local identPerm = (floor(b[4] / 8) % 2) == 1
   local byte2canon = {}
   local permBytes = { len = numCanon }
-  for i = 0, numCanon - 1 do local pb = u8(); byte2canon[pb] = i; permBytes[i] = pb end
+  for i = 0, numCanon - 1 do local pb; if identPerm then pb = i else pb = pool[i] end; byte2canon[pb] = i; permBytes[i] = pb end
+  local codeSeed = rng() % MASK32
+  local constSeed = rng() % MASK32
   -- independent domain: dispatch (opcode permutation)
   if fnv1a(permBytes) ~= dDispatch then error('integrity check failed: dispatch domain') end
 

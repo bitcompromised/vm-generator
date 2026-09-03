@@ -40,6 +40,8 @@ class VMObj {
   get(k) { k = String(k); if (k in this.map) return this.map[k]; if (this.proto && typeof this.proto.get === 'function') return this.proto.get(k); return null; }
   set(k, v) { k = String(k); if (!(k in this.map)) this.keys.push(k); this.map[k] = v; }
   has(k) { return String(k) in this.map || (this.proto && this.proto.has && this.proto.has(k)); }
+  // Serialize as a plain object (for JSON.stringify and native consumers).
+  toJSON() { const o = {}; for (const k of this.keys) o[k] = this.map[k]; return o; }
 }
 const isObj = (v) => v instanceof VMObj;
 const isClosure = (v) => !!v && typeof v === 'object' && v.__closure === true;
@@ -340,7 +342,7 @@ async function interpret(program, opts = {}) {
   function makeFrame(fnIdx, argc, upvals) {
     const callee = fns[fnIdx];
     const locals = mkCells(callee.nlocals);
-    for (let k = argc - 1; k >= 0; k--) locals[k].v = stack.pop();
+    for (let k = argc - 1; k >= 0; k--) { const kv = stack.pop(); if (k < callee.nparams) locals[k].v = kv; }
     frames.push(frame);
     return { idx: fnIdx, fn: callee, i: 0, locals, upvals: upvals || [] };
   }
@@ -349,7 +351,7 @@ async function interpret(program, opts = {}) {
   function runFrameSync(fnIdx, argc, upvals, thisObj) {
     const localFn = fns[fnIdx];
     const locals = mkCells(localFn.nlocals);
-    for (let k = argc - 1; k >= 0; k--) locals[k].v = stack.pop();
+    for (let k = argc - 1; k >= 0; k--) { const kv = stack.pop(); if (k < localFn.nparams) locals[k].v = kv; }
     const localFrame = { idx: fnIdx, fn: localFn, i: 0, locals, upvals: upvals || [], thisObj: thisObj || null };
     const localStack = [];
     const localMaps = maps[fnIdx];
@@ -605,7 +607,7 @@ async function interpret(program, opts = {}) {
   async function runFrameAsync(fnIdx, argc, upvals, thisObj) {
     const localFn = fns[fnIdx];
     const locals = mkCells(localFn.nlocals);
-    for (let k = argc - 1; k >= 0; k--) locals[k].v = stack.pop();
+    for (let k = argc - 1; k >= 0; k--) { const kv = stack.pop(); if (k < localFn.nparams) locals[k].v = kv; }
     const localFrame = { idx: fnIdx, fn: localFn, i: 0, locals, upvals: upvals || [], thisObj: thisObj || null };
     const localStack = [];
     const localMaps = maps[fnIdx];
@@ -994,8 +996,7 @@ async function interpret(program, opts = {}) {
           vmPromise.set('then', { __closure: true, __host: 'promiseThen', __promiseRef: vmPromise });
           stack.push(vmPromise);
         } else {
-          if (!isClosure(callee)) throw new Error('value is not callable: ' + toStr(callee));
-          for (let k = 0; k < argc; k++) stack.push(args[k]);
+          // args are already on the stack from the push above; makeFrame pops them.
           frame = makeFrame(callee.fn, argc, callee.upvals);
         }
         break;

@@ -29,7 +29,9 @@ function makeRequire(baseDir) {
   const path = require('path');
   return function requireBridge(spec) {
     try {
-      if (spec && (spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('/') || /^[A-Za-z]:[\\/]/.test(spec))) {
+      // Any relative specifier (including bare '.' / '..') resolves against the
+      // source file's directory; bare package names go to normal resolution.
+      if (spec && (/^\.\.?([\\/]|$)/.test(spec) || spec.startsWith('/') || /^[A-Za-z]:[\\/]/.test(spec))) {
         return require(path.resolve(baseDir || process.cwd(), spec));
       }
       return require(spec);

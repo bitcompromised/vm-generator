@@ -41,8 +41,12 @@ function lex(src) {
   let i = 0, line = 1, col = 1;
   const N = src.length;
 
-  const adv = (n = 1) => { for (let k = 0; k < n; k++) { if (src[i] === '\n') { line++; col = 1; } else { col++; } i++; } };
-  const push = (type, value) => toks.push({ type, value, line, col });
+  // Tracks whether a newline was seen since the previous token, so the parser
+  // can treat a line break as an implicit statement terminator (ASI-lite). This
+  // makes semicolons optional and removes semicolon-dependent parsing.
+  let nlPending = false;
+  const adv = (n = 1) => { for (let k = 0; k < n; k++) { if (src[i] === '\n') { line++; col = 1; nlPending = true; } else { col++; } i++; } };
+  const push = (type, value) => { toks.push({ type, value, line, col, nl: nlPending }); nlPending = false; };
 
   while (i < N) {
     const c = src[i];
@@ -56,6 +60,22 @@ function lex(src) {
       adv(2);
       while (i < N && !(src[i] === '*' && src[i + 1] === '/')) adv();
       adv(2);
+      continue;
+    }
+
+    // inline compiler directive:  <@name arg1 arg2 ...>
+    // Emitted as a `directive` token so the parser can attach it to the next
+    // statement / function / binding / expression. Checked before the `<`
+    // operator; `<@` is unambiguous (no expression starts with `@`).
+    if (c === '<' && src[i + 1] === '@') {
+      adv(2);
+      let body = '';
+      while (i < N && src[i] !== '>') { body += src[i]; adv(); }
+      if (src[i] === '>') adv();
+      const parts = body.trim().match(/"[^"]*"|'[^']*'|\S+/g) || [];
+      const name = (parts[0] || '').toLowerCase();
+      const args = parts.slice(1).map((a) => (/^["']/.test(a) ? a.slice(1, -1) : a));
+      push('directive', { name, args });
       continue;
     }
 

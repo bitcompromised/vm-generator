@@ -1,0 +1,117 @@
+Language:
+  + Add for, break, continue, ternary expressions, compound assignments, increment/decrement, richer literals, objects/maps, property access, methods, exceptions, try/catch/finally, optional modules/imports, anonymous functions, closures/upvalues
+
+Every transformation should preserve code so protection is never allowed to become part of language semantics.
+
+Stack VM vs Register VM:
+  + Encode the bytecode array.
+
+Conceal strings and integers in the constant pool:
+  + Hold integers as a unsolved expression, and strings similarly.
+  + flatten control flow.
+  + Introduce optimization, for ex: 2+3*4 becomes 14 at compile time.
+  + constant folding
+  + constant propagation
+  + dead-code elimination
+  + unreachable-block removal
+  + jump threading
+  + local-variable optimization
+  + peephole optimization
+  + basic-block formation
+
+Virtualization:
+  + Instruction-set polymorphism
+    - ADD SUB MUL DIV -> ADD_SUB_MUL_DIV
+  + Don't merely rename instructions. Generate different implementations of them.
+
+Basic-block virtualization:
+  + Use block IDs / translated targets
+    1. compile blocks
+    2. randomly serialize them:
+
+Control-flow virtualization:
+  + Introduce a dispatcher model
+    - Not a static giant switch with obvious block numbers
+    - Generate per-build dispatch structures
+
+Constant Protection:
+  + Configurable subsystem
+    - strings/numbers/booleans/metadata
+    - plain/xor/encoded/fragmented/lazy-decode/derived
+
+Cryptography:
+  + artifact authenticity, signature verification, version / license / entitlement, server-backed secrets.
+
+Anti-Tamper architecture
+  + Replace single checksum check with multiple independant integrity domains:
+    - header integrity
+    - constant integrity
+    - function integrity
+    - dispatch integrity
+    - runtime integrity
+
+Anti-Analysis:
+  + runtime consistency check
+  + unexpected state detection
+  + VM-version validation
+  + artifact authenticity
+  + optional sever authorization
+  + controlled failure behavior
+  + feature/license validation
+
+Selective virtualization:
+  + allow @native @virtualize & <@weak/@medium/@heavy obfuscation>
+  ex:`
+  function a(){
+    console.log("test");
+  }`
+Fuzzer:
+  + fuzz lexer, parser, compiler, image decoder, vm, with malformed inputs.
+  + especially truncated image, corrupt length, invalid opcode, invalid jump, stack underflow, bad constant index, recursive call explosion, integer overflow, NaN / Infinity, malformed UTF-8
+
+Formalize the bytecode format so future VM generations can coexist. VG, major, minor, flags, profile, architecture, checksum.
+
+Build-Profiles:
+vm-gen build app.vgs \
+  --target js \
+  --profile aggressive \
+  --seed random
+->
+development
+├── readable
+├── deterministic
+└── debugging
+
+balanced
+├── virtualization
+├── encrypted constants
+└── polymorphic opcodes
+
+aggressive
+├── polymorphic VM
+├── block permutation
+├── instruction transforms
+├── lazy constants
+└── integrity binding
+
+performance
+├── register VM
+├── optimized dispatch
+└── minimal protection
+
+VM-architecture:
+  + generate different vm architectures.
+  -VM-A --vm-profile balanced
+   * stack-based
+   * switch dispatcher
+
+  -VM-B --vm-profile aggressive
+   * register-based
+   * threaded-style dispatcher
+
+  -VM-C --vm-profile compact
+   * register + encrypted state
+   * indirect dispatcher
+
+  -VM-D --vm-profile performance
+   * stack + block dispatcher

@@ -36,6 +36,8 @@ module.exports = {
   FLAG_OPTIMIZED: 0x01, // compile-time optimizer was applied
   FLAG_LIMITED: 0x02,   // runtime resource limits are enforced
   FLAG_SIGNED: 0x04,    // artifact carries a keyed MAC verified at runtime
+  FLAG_IDENTPERM: 0x08, // opcode permutation is identity (development builds)
+  FLAG_DERIVED: 0x10,   // seeds + permutation are derived from a hidden master seed (not stored)
 
   // Build profiles (header byte 5).
   PROFILES: { development: 0, balanced: 1, aggressive: 2, performance: 3 },
@@ -50,9 +52,11 @@ module.exports = {
 // Per-profile build configuration. `optimize` and `permute` shape the artifact;
 // `maxSteps` / `maxDepth` are runtime resource limits embedded into the VM
 // (0 = unlimited). These are defaults; explicit CLI flags override them.
+// `maxObjects` caps live object/array allocations; `maxString` caps the length
+// of any single string produced by concatenation. Both 0 = unlimited.
 module.exports.PROFILE_CONFIG = {
-  development: { optimize: false, permute: false, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, arch: 'stack-switch' },
-  balanced: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 1024, arch: 'stack-switch' },
-  aggressive: { optimize: true, permute: true, conceal: true, dud: true, maxSteps: 200000000, maxDepth: 512, arch: 'stack-switch' },
-  performance: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, arch: 'stack-switch' },
+  development: { optimize: false, permute: false, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, maxObjects: 0, maxString: 0, arch: 'stack-switch' },
+  balanced: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 1024, maxObjects: 0, maxString: 0, arch: 'stack-switch' },
+  aggressive: { optimize: true, permute: true, conceal: true, dud: true, maxSteps: 200000000, maxDepth: 512, maxObjects: 5000000, maxString: 33554432, arch: 'stack-switch' },
+  performance: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, maxObjects: 0, maxString: 0, arch: 'stack-switch' },
 };

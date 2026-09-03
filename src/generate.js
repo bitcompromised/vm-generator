@@ -25,6 +25,8 @@ function resolveConfig(options = {}) {
     dudCount: options.dudCount,
     maxSteps: pick('maxSteps'),
     maxDepth: pick('maxDepth'),
+    maxObjects: pick('maxObjects'),
+    maxString: pick('maxString'),
     arch: options.arch || base.arch,
   };
 }
@@ -33,7 +35,7 @@ function generate(source, options = {}) {
   const target = (options.target || 'js').toLowerCase();
   const cfg = resolveConfig(options);
   const program = compile(source, { optimize: cfg.optimize, resolveImport: options.resolveImport });
-  const limited = cfg.maxSteps > 0 || cfg.maxDepth > 0;
+  const limited = cfg.maxSteps > 0 || cfg.maxDepth > 0 || cfg.maxObjects > 0 || cfg.maxString > 0;
 
   const { image, meta } = buildImage(program, {
     seed: options.seed,
@@ -48,7 +50,7 @@ function generate(source, options = {}) {
     signKey: options.sign,
   });
 
-  const emitOpts = Object.assign({}, options, { maxSteps: cfg.maxSteps, maxDepth: cfg.maxDepth });
+  const emitOpts = Object.assign({}, options, { maxSteps: cfg.maxSteps, maxDepth: cfg.maxDepth, maxObjects: cfg.maxObjects, maxString: cfg.maxString, salt: meta.salt });
   let out;
   if (target === 'js' || target === 'javascript') out = emitJs(image, emitOpts);
   else if (target === 'lua') out = emitLua(image, emitOpts);

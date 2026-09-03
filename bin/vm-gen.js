@@ -150,6 +150,7 @@ async function main() {
       target, banner: opts.banner, seed: opts.seed, profile: opts.profile,
       optimize: opts.optimize, maxSteps: opts.maxSteps, maxDepth: opts.maxDepth, sign: opts.sign,
       dud: opts.dud, dudCount: opts.dudCount, arch: opts.arch, resolveImport,
+      sourceDir: path.dirname(path.resolve(file)),
     });
     fs.writeFileSync(out, output);
     console.error(`vm-gen: wrote ${path.relative(process.cwd(), out)} `

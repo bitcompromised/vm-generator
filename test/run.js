@@ -32,9 +32,10 @@ function runJs(source, seed) {
   });
 }
 
-// Run generated JS from an explicit image (used by the tamper test).
-function runJsImage(image) {
-  const output = emitJs(image, { banner: false });
+// Run generated JS from an explicit image (used by the tamper test). The salt
+// (from buildImage's meta) lets the VM recover the derived seeds/permutation.
+function runJsImage(image, salt) {
+  const output = emitJs(image, { banner: false, salt: salt });
   return captureStdout(() => {
     new Function('module', 'exports', 'require', 'process', 'console', 'Buffer', output)(
       { exports: {} }, {}, require, process, console, Buffer);
@@ -175,19 +176,19 @@ if (fengari) {
 console.log('== integrity / tamper detection ==');
 {
   const program = compile('print 1 + 1;');
-  const { image } = buildImage(program, { seed: 5 });
+  const { image, meta } = buildImage(program, { seed: 5 });
   // untampered runs fine
   let clean;
-  try { clean = runJsImage(image); } catch (e) { clean = ['<throw> ' + e.message]; }
+  try { clean = runJsImage(image, meta.salt); } catch (e) { clean = ['<throw> ' + e.message]; }
   ok('clean image runs', JSON.stringify(clean) === JSON.stringify(['2']), `got ${JSON.stringify(clean)}`);
   // flip one body byte (offset 10 is inside the checksummed body)
   const tampered = image.slice();
   tampered[10] = (tampered[10] ^ 0xff) & 0xff;
   let threw = false;
-  try { runJsImage(tampered); } catch (_) { threw = true; }
+  try { runJsImage(tampered, meta.salt); } catch (_) { threw = true; }
   // the VM catches internally and prints to stderr; detect by absence of '2'
   let tamperedOut = [];
-  try { tamperedOut = runJsImage(tampered); } catch (_) { threw = true; }
+  try { tamperedOut = runJsImage(tampered, meta.salt); } catch (_) { threw = true; }
   ok('tampered image rejected', threw || JSON.stringify(tamperedOut) !== JSON.stringify(['2']),
     `got ${JSON.stringify(tamperedOut)}`);
 }
