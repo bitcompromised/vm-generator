@@ -340,6 +340,7 @@ local function host(name, args)
   elseif name == 'inop' then return false
   elseif name == 'require' then return NULL
   elseif name == '__new' then return NULL
+  elseif name == '__defaccessor' then local o = args[0]; if isObj(o) then objSet(o, args[1], args[3]) end; return o
   elseif name == '__regex' then return NULL
   elseif name == 'len' then local a = args[0]; if isArr(a) then return a.n elseif isObj(a) then return a.keys.n else return #tostring(a) end
   elseif name == 'str' then return toStr(args[0])

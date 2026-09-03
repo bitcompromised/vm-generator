@@ -218,14 +218,27 @@ ${opConstBlock()}
   function truthy(v) { return !(v === null || v === undefined || v === false || v === 0 || v === ''); }
   function u32of(n) { return n >>> 0; }
   function idxGet(obj, key) {
-    if (isObj(obj)) return obj.get(key);
+    if (isObj(obj)) {
+      if (obj.__getters && Object.prototype.hasOwnProperty.call(obj.__getters, key)) return __runMethod(obj.__getters[key], obj, []);
+      return obj.get(key);
+    }
+    if (isClosure(obj)) {
+      // Function.prototype.bind/call/apply on VM closures, bridged to real calls.
+      if (key === 'bind') return function () { var t = arguments[0], b = Array.prototype.slice.call(arguments, 1); return function () { return __runMethod(obj, t, b.concat(Array.prototype.slice.call(arguments))); }; };
+      if (key === 'call') return function () { return __runMethod(obj, arguments[0], Array.prototype.slice.call(arguments, 1)); };
+      if (key === 'apply') return function () { return __runMethod(obj, arguments[0], arguments[1] || []); };
+      return undefined;
+    }
     if (Array.isArray(obj)) return obj[key];
     if (typeof obj === 'string') { if (key === 'length') return obj.length; return obj[key]; }
     if (obj === null || obj === undefined) throw new Error('cannot index ' + toStr(obj));
     return obj[key]; // native object / function / number
   }
   function idxSet(obj, key, val) {
-    if (isObj(obj)) { obj.set(key, val); return; }
+    if (isObj(obj)) {
+      if (obj.__setters && Object.prototype.hasOwnProperty.call(obj.__setters, key)) { __runMethod(obj.__setters[key], obj, [val]); return; }
+      obj.set(key, val); return;
+    }
     if (Array.isArray(obj)) { obj[key] = val; return; }
     if (obj && (typeof obj === 'object' || typeof obj === 'function')) { obj[key] = val; return; }
     throw new Error('cannot assign index of ' + toStr(obj));
@@ -263,15 +276,21 @@ ${opConstBlock()}
     if (isObj(c) && c.get('__isClass')) { var k = isObj(o) ? o.__classRef : null; while (k && isObj(k)) { if (k === c) return true; k = k.get('__super'); } return false; }
     return false;
   }
+  var __runMethod = null; // set inside run(): (closure, thisObj, args) -> result
   function __newObj(args) {
     var cls = args[0], rest = args.slice(1);
-    if (typeof cls === 'function') { try { return new (Function.prototype.bind.apply(cls, [null].concat(rest)))(); } catch (e) { return null; } }
+    if (typeof cls === 'function') { try { for (var a = 0; a < rest.length; a++) rest[a] = toNativeJs(rest[a]); return new (Function.prototype.bind.apply(cls, [null].concat(rest)))(); } catch (e) { return null; } }
     if (isObj(cls) && cls.get('__isClass')) {
       var inst = new VMObj(); inst.__classRef = cls;
       var chain = [], c = cls;
       while (c && isObj(c) && c.get('__isClass')) { chain.unshift(c); c = c.get('__super'); }
+      // copy methods (base first so derived overrides win)
       for (var i = 0; i < chain.length; i++) { var m = chain[i].get('__methods'); if (isObj(m)) for (var j = 0; j < m.keys.length; j++) inst.set(m.keys[j], m.map[m.keys[j]]); }
-      return inst; // best-effort: VM-class constructor body is not run in the standalone VM
+      // run the nearest constructor with this = inst
+      var ctor = null;
+      for (var ci = chain.length - 1; ci >= 0; ci--) { var cc = chain[ci].get('__ctor'); if (cc) { ctor = cc; break; } }
+      if (ctor && isClosure(ctor) && __runMethod) __runMethod(ctor, inst, rest);
+      return inst;
     }
     return null;
   }
@@ -303,6 +322,7 @@ ${opConstBlock()}
       case 'inop': { var k = args[0], o = args[1]; if (isObj(o)) return o.has(k); if (Array.isArray(o)) return Number(k) >= 0 && Number(k) < o.length; if (o && typeof o === 'object') return k in o; return false; }
       case 'require': return __requireBridge(args[0]);
       case '__new': return __newObj(args);
+      case '__defaccessor': { var o = args[0]; if (isObj(o)) { if (args[2] === 'get') { (o.__getters || (o.__getters = {}))[args[1]] = args[3]; } else { (o.__setters || (o.__setters = {}))[args[1]] = args[3]; } } return o; }
       case '__regex': { try { return new RegExp(args[0], args[1] || ''); } catch (e) { return null; } }
       default: throw new Error('unknown host builtin ' + name);
     }
@@ -477,17 +497,19 @@ ${opConstBlock()}
     }
 
     // Run a VM closure to completion and return its result (re-enters exec).
-    function runClosure(closure, args) {
+    // An optional thisObj binds the receiver (used for methods / constructors).
+    function runClosure(closure, args, thisObj) {
       var fn = fns[closure.fn];
       var locals = mkCells(fn.nlocals);
       for (var k = 0; k < args.length && k < fn.nparams; k++) locals[k].v = args[k];
       frames.push(frame);
       var rd = frames.length;
-      frame = { fn: fn, ip: 0, locals: locals, upvals: closure.upvals };
+      frame = { fn: fn, ip: 0, locals: locals, upvals: closure.upvals, thisObj: thisObj };
       var rv = exec(rd);
       frame = frames.pop();
       return rv;
     }
+    __runMethod = function (closure, thisObj, args) { return runClosure(closure, args, thisObj); };
     // Wrap a VM closure as a real JS callable so it can be handed to native host
     // methods (Array.map, Promise.then, ...).
     toNativeJs = function (v) {

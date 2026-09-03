@@ -217,16 +217,28 @@ class Compiler {
   finishFn(fe) {
     let instrs = fe.instrs;
 
-    // Inject CLOSE_UPVALUE before each RET for any local slots captured by upvalues
+    // Inject CLOSE_UPVALUE before each RET for any local slots captured by
+    // upvalues. Inserting instructions shifts indices, so jump-target labels
+    // ({pos}) must be remapped from old indices to new ones -- otherwise any
+    // if/while/for jump past an insertion point lands on the wrong instruction.
     const localsToClose = new Set();
     for (const u of fe.upvals) if (u.fromLocal) localsToClose.add(u.index);
     if (localsToClose.size > 0) {
       const newInstrs = [];
-      for (const ins of instrs) {
-        if (ins.op === OP.RET) {
+      const map = new Array(instrs.length + 1);
+      for (let i = 0; i < instrs.length; i++) {
+        map[i] = newInstrs.length; // old index i -> new index (before its content)
+        if (instrs[i].op === OP.RET) {
           for (const slot of Array.from(localsToClose)) newInstrs.push({ op: OP.CLOSE_UPVALUE, args: [slot] });
         }
-        newInstrs.push(ins);
+        newInstrs.push(instrs[i]);
+      }
+      map[instrs.length] = newInstrs.length;
+      const seen = new Set();
+      for (const ins of newInstrs) {
+        for (const a of ins.args) {
+          if (a && typeof a === 'object' && 'pos' in a && !seen.has(a)) { a.pos = map[a.pos]; seen.add(a); }
+        }
       }
       instrs = newInstrs;
     }
@@ -542,14 +554,25 @@ class Compiler {
       }
       case 'Object': {
         let n = 0;
+        const accessors = [];
         for (const pr of e.props) {
           if (pr.spread) continue; // best-effort: object spread not modelled
+          if (pr.kind === 'get' || pr.kind === 'set') { accessors.push(pr); continue; }
           if (pr.computed && pr.keyNode) this.compileExpr(fe, pr.keyNode);
           else fe.emit(OP.PUSH_CONST, this.constId(String(pr.key)));
           this.compileExpr(fe, pr.value);
           n++;
         }
         fe.emit(OP.NEW_OBJ, n);
+        // install getters/setters on the freshly-built object via a host call
+        for (const acc of accessors) {
+          fe.emit(OP.DUP);
+          fe.emit(OP.PUSH_CONST, this.constId(String(acc.key)));
+          fe.emit(OP.PUSH_CONST, this.constId(acc.kind));
+          this.compileExpr(fe, acc.value);
+          fe.emit(OP.CALL_HOST, this.hostId('__defaccessor'), 4);
+          fe.emit(OP.POP);
+        }
         break;
       }
       case 'New': {

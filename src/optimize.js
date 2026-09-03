@@ -109,7 +109,10 @@ function optExpr(e) {
     case 'Index': return { type: 'Index', object: optExpr(e.object), index: optExpr(e.index) };
     case 'Member': return { type: 'Member', object: optExpr(e.object), property: e.property };
     case 'Array': return { type: 'Array', elements: e.elements.map(optExpr) };
-    case 'Object': return { type: 'Object', props: e.props.map((p) => ({ key: p.key, value: optExpr(p.value) })) };
+    case 'Object': return { type: 'Object', props: e.props.map((p) => (
+      p.spread ? { spread: optExpr(p.spread) }
+        : { key: p.key, kind: p.kind, computed: p.computed, keyNode: p.keyNode ? optExpr(p.keyNode) : undefined, value: optExpr(p.value) }
+    )) };
     case 'FnExpr': return { type: 'FnExpr', name: e.name, params: e.params, body: { type: 'Block', body: optBody(e.body.body, e.params) } };
     default: return e; // literals and identifiers pass through
   }
@@ -197,6 +200,10 @@ function optSeq(stmts) {
 function collectNames(stmts, decl, assigned) {
   const visitExpr = (e) => {
     if (!e || typeof e !== 'object') return;
+    // An assignment can appear in expression position (e.g. `a = b = c`, or the
+    // `(q = q + 1)` a postfix `q++` lowers to). Mark its target as assigned so it
+    // is never mistaken for a write-once constant.
+    if (e.type === 'Assign' && e.target && e.target.type === 'Ident') assigned[e.target.name] = true;
     for (const k of Object.keys(e)) {
       const v = e[k];
       if (Array.isArray(v)) v.forEach(visitExpr);
@@ -248,11 +255,12 @@ function substReads(node, consts) {
   return node;
 }
 
-// Collect every identifier name that appears inside a nested function
-// expression -- these may be upvalues, so we must not drop their bindings.
+// Collect every identifier name that appears inside a nested function (both
+// expressions AND declarations) -- these may be captured as upvalues, so we must
+// not inline or drop their bindings, or the upvalue's backing slot disappears.
 function collectClosedOver(node, into) {
   if (!node || typeof node !== 'object') return;
-  if (node.type === 'FnExpr') { collectIdents(node, into); return; }
+  if (node.type === 'FnExpr' || node.type === 'FnDecl') { collectIdents(node, into); return; }
   for (const k of Object.keys(node)) {
     const v = node[k];
     if (Array.isArray(v)) v.forEach((x) => collectClosedOver(x, into));

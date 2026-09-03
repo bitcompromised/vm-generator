@@ -289,6 +289,7 @@ async function interpret(program, opts = {}) {
       }
       case 'require': return requireBridge(args[0]);
       case '__new': return hostNew(args);
+      case '__defaccessor': { const o = args[0]; if (isObj(o)) { if (args[2] === 'get') { (o.__getters || (o.__getters = {}))[args[1]] = args[3]; } else { (o.__setters || (o.__setters = {}))[args[1]] = args[3]; } } return o; }
       case '__regex': { try { return new RegExp(args[0], args[1] || ''); } catch (_) { return null; } }
       default: throw new Error('unknown host builtin ' + name);
     }
