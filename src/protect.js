@@ -14,8 +14,16 @@
 // JS and Lua VMs (see emit-js.js / emit-lua.js). The unit tests round-trip
 // through both to guarantee they stay in lock-step.
 
-const { OP_NAME, OP_OPERANDS } = require('./opcodes');
+const { OP, OP_NAME, OP_OPERANDS } = require('./opcodes');
 const V = require('./version');
+
+// Plausible-looking names for decoy ("dud") functions. They are never called;
+// their only purpose is to give a static analyst extra believable code to read.
+const DUD_NAMES = [
+  'validateLicense', 'deriveSessionKey', 'checkEntitlement', 'unpackResource',
+  'rotateKeystream', 'verifyManifest', 'decodeTelemetry', 'resolveBinding',
+  'scrubHeap', 'auditTable', 'reseedEntropy', 'flushDispatch',
+];
 
 const MASK32 = 0x100000000; // 2^32
 
@@ -134,6 +142,54 @@ function serializeConsts(consts, conceal, rng) {
   return blob;
 }
 
+// ---- dud (decoy) code generation ----
+// Produce one decoy function's PLAIN (pre-cipher) byte stream: a syntactically
+// well-formed sequence of permuted instructions terminated by RET. It is never
+// referenced by any CALL/CLOSURE, so it never executes -- but once an analyst
+// breaks the cipher it disassembles into believable, load-bearing-looking code,
+// multiplying the surface they must understand. Operands are kept in plausible
+// ranges so the decoy does not stand out as obviously bogus.
+function makeDudBytes(perm, numCanon, nconsts, nlocals, rng) {
+  const bytes = [];
+  const nIns = 4 + (rng() % 12);
+  // Prefer opcodes whose operands index existing consts/locals so the decoy is
+  // internally consistent; fall back to any canonical op.
+  for (let k = 0; k < nIns; k++) {
+    const canon = rng() % numCanon;
+    if (canon === OP.RET || canon === OP.HALT) { k--; continue; } // keep terminators for the end
+    bytes.push(perm[canon]);
+    const kinds = OP_OPERANDS[canon];
+    for (const kind of kinds) {
+      // bound u16 operands to a plausible index space; u8 to a small count
+      const cap = kind === 'u16' ? Math.max(1, Math.max(nconsts, nlocals)) : Math.max(1, nlocals || 1);
+      const v = rng() % cap;
+      if (kind === 'u16') bytes.push(v & 0xff, (v >>> 8) & 0xff);
+      else bytes.push(v & 0xff);
+    }
+  }
+  bytes.push(perm[OP.PUSH_NULL]);
+  bytes.push(perm[OP.RET]);
+  return bytes;
+}
+
+// Build `count` decoy function images to append after the real function table.
+// `startIdx` is the flat index the first decoy will occupy so its cipher key
+// (which is keyed by function index) matches what the VM derives on decode.
+function makeDudFunctions(count, startIdx, perm, numCanon, codeSeed, nconsts, rng) {
+  const duds = [];
+  for (let k = 0; k < count; k++) {
+    const idx = startIdx + k;
+    const nparams = rng() % 4;
+    const nlocals = nparams + (rng() % 6);
+    const level = rng() % 4; // 0..3 cipher rounds, mirroring selective virtualization
+    const plain = makeDudBytes(perm, numCanon, nconsts, nlocals, rng);
+    const enc = encRounds(plain, codeSeed, idx, level);
+    const name = DUD_NAMES[rng() % DUD_NAMES.length];
+    duds.push({ name, nparams, nlocals, upvals: [], protLevel: level, enc });
+  }
+  return duds;
+}
+
 // Build the full protected image.  Returns { image: number[], meta }.
 function buildImage(program, options = {}) {
   const rng = makeRng(options.seed !== undefined ? options.seed : (Date.now() >>> 0));
@@ -164,6 +220,19 @@ function buildImage(program, options = {}) {
     const enc = encRounds(plain, codeSeed, idx, level);
     return { name: fn.name, nparams: fn.nparams, nlocals: fn.nlocals, upvals: fn.upvals || [], protLevel: level, enc };
   });
+
+  // Dud-code injection: append decoy functions to the datastream. They are
+  // appended AFTER every real function so real function indices (baked into
+  // CALL/CLOSURE operands) are untouched, and no instruction references them, so
+  // they never run. They are covered by the function-integrity domain like any
+  // real function. All draws happen here, after real content, so enabling duds
+  // never perturbs the bytes of the real program for a given seed.
+  const realFnCount = fnImages.length;
+  if (options.dud) {
+    const count = (options.dudCount != null) ? options.dudCount : (2 + (rng() % 3));
+    const duds = makeDudFunctions(count, realFnCount, perm, numCanon, codeSeed, program.consts.length, rng);
+    for (const d of duds) fnImages.push(d);
+  }
 
   // ---- assemble body ----
   const body = [];
@@ -237,7 +306,8 @@ function buildImage(program, options = {}) {
       major: V.FORMAT_MAJOR, minor: V.FORMAT_MINOR, flags,
       profile: profileName, arch: archName, signed,
       domains: { header: dHeader, dispatch: dDispatch, const: dConst, fn: dFn },
-      numFns: fnImages.length, imageSize: image.length,
+      numFns: fnImages.length, realFns: realFnCount, dudFns: fnImages.length - realFnCount,
+      imageSize: image.length,
     },
   };
 }

@@ -102,6 +102,7 @@ implement the exact same algorithms, bit for bit.
 | 3 | **Constant-pool encryption** | Strings and numeric literals are serialized and encrypted with a separate `constSeed`, so string scanning the artifact reveals nothing. |
 | 4 | **Integrity / anti-tamper** | An FNV-1a checksum covers the whole image body. The VM verifies it at startup and **refuses to run** a modified image. Flip one byte and it aborts. |
 | 5 | **Bytecode virtualization** | The program never exists as native JS/Lua — it runs on a custom stack machine, so there is no source-level control flow to read. |
+| 6 | **Dud-code injection** | Decoy functions are appended to the image's function table. They are never referenced by any call, so they never execute, but once the cipher is broken they disassemble into believable code — padding the datastream an analyst must read. On by default for the `aggressive` profile; toggle with `--dud` / `--no-dud` (and size with `--dud-count N`). |
 
 Because 1–3 are all seeded from a single build seed, `--seed N` gives you
 **reproducible** builds, while omitting it gives a fresh, unique VM every time:

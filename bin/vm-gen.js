@@ -40,6 +40,9 @@ Options:
   --sign         <key>                   Embed a keyed signature; the VM then runs
                                          only when env VMGEN_KEY matches this key
   --no-optimize                          Disable compile-time optimization
+  --dud, --no-dud                        Force decoy ("dud") functions on/off
+                                         (default: on for the aggressive profile)
+  --dud-count    <number>                Number of decoy functions to inject
   --no-banner                            Omit the generated-file header comment
   --trace                                (exec) print a full execution trace
   --version, -v                          Print version information
@@ -70,6 +73,9 @@ function parseArgs(argv) {
     else if (a === '--sign') opts.sign = argv[++i];
     else if (a === '--arch') opts.arch = argv[++i];
     else if (a === '--no-optimize') opts.optimize = false;
+    else if (a === '--dud') opts.dud = true;
+    else if (a === '--no-dud') opts.dud = false;
+    else if (a === '--dud-count') opts.dudCount = parseInt(argv[++i], 10);
     else if (a === '--no-banner') opts.banner = false;
     else if (a === '--trace') opts.trace = true;
     else if (a === '--version' || a === '-v') opts.version = true;
@@ -79,7 +85,7 @@ function parseArgs(argv) {
   return opts;
 }
 
-function main() {
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.version) { versionInfo(); return; }
   const cmd = opts._[0];
@@ -101,7 +107,7 @@ function main() {
   if (cmd === 'exec') {
     // Reference interpreter: no protection, optional debug trace.
     const program = compile(source, { optimize: opts.optimize, resolveImport });
-    const res = interpret(program, { trace: opts.trace });
+  const res = await interpret(program, { trace: opts.trace });
     if (opts.trace) {
       for (const t of res.trace) {
         console.error(`#${String(t.step).padStart(5)} ${t.fn}@${t.i} ${t.op}`
@@ -115,10 +121,18 @@ function main() {
   }
 
   if (cmd === 'run') {
-    const { output } = generate(source, { target: 'js', banner: false, seed: opts.seed, profile: opts.profile, optimize: opts.optimize, maxSteps: opts.maxSteps, maxDepth: opts.maxDepth, resolveImport });
-    const mod = { exports: {} };
-    new Function('module', 'exports', 'require', 'process', 'console', 'Buffer', output)(
-      mod, mod.exports, require, process, console, Buffer);
+    // For faster development and correct semantics (top-level await), run on the reference interpreter.
+    const program = compile(source, { optimize: opts.optimize, resolveImport });
+    const res = await interpret(program, { trace: opts.trace, maxSteps: opts.maxSteps, dir: path.dirname(path.resolve(file)) });
+    if (opts.trace) {
+      for (const t of res.trace) {
+        console.error(`#${String(t.step).padStart(5)} ${t.fn}@${t.i} ${t.op}`
+          + `${t.args.length ? ' ' + t.args.join(',') : ''}`
+          + `  stack=[${t.stack.map(String).join(', ')}]`);
+      }
+      console.error(`-- ${res.steps} steps --`);
+    }
+    for (const line of res.output) process.stdout.write(line + '\n');
     return;
   }
 
@@ -134,7 +148,8 @@ function main() {
     const out = opts.out || (file.replace(/\.[^.]+$/, '') + '.vm' + ext);
     const { output, meta } = generate(source, {
       target, banner: opts.banner, seed: opts.seed, profile: opts.profile,
-      optimize: opts.optimize, maxSteps: opts.maxSteps, maxDepth: opts.maxDepth, sign: opts.sign, resolveImport,
+      optimize: opts.optimize, maxSteps: opts.maxSteps, maxDepth: opts.maxDepth, sign: opts.sign,
+      dud: opts.dud, dudCount: opts.dudCount, arch: opts.arch, resolveImport,
     });
     fs.writeFileSync(out, output);
     console.error(`vm-gen: wrote ${path.relative(process.cwd(), out)} `
@@ -148,4 +163,4 @@ function main() {
   process.exit(2);
 }
 
-main();
+main().catch((e) => { console.error(e); process.exit(1); });

@@ -51,8 +51,8 @@ module.exports = {
 // `maxSteps` / `maxDepth` are runtime resource limits embedded into the VM
 // (0 = unlimited). These are defaults; explicit CLI flags override them.
 module.exports.PROFILE_CONFIG = {
-  development: { optimize: false, permute: false, conceal: false, maxSteps: 0, maxDepth: 0, arch: 'stack-switch' },
-  balanced: { optimize: true, permute: true, conceal: false, maxSteps: 0, maxDepth: 1024, arch: 'stack-switch' },
-  aggressive: { optimize: true, permute: true, conceal: true, maxSteps: 200000000, maxDepth: 512, arch: 'stack-switch' },
-  performance: { optimize: true, permute: true, conceal: false, maxSteps: 0, maxDepth: 0, arch: 'stack-switch' },
+  development: { optimize: false, permute: false, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, arch: 'stack-switch' },
+  balanced: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 1024, arch: 'stack-switch' },
+  aggressive: { optimize: true, permute: true, conceal: true, dud: true, maxSteps: 200000000, maxDepth: 512, arch: 'stack-switch' },
+  performance: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, arch: 'stack-switch' },
 };

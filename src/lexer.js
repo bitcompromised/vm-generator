@@ -8,6 +8,13 @@ const KEYWORDS = new Set([
   // .js-friendly aliases (see KW_ALIAS) so plain JavaScript in the supported
   // subset can be used as input directly.
   'function', 'const', 'var',
+  // Common JS keywords supported by the front-end
+  'new', 'async', 'await',
+  // Broader JS surface (classes, modules, operators). `of`, `from`, `get`, `set`,
+  // `static` and `as` stay ordinary identifiers and are recognised contextually
+  // by the parser, so code may still use them as names.
+  'class', 'extends', 'super', 'typeof', 'instanceof', 'in',
+  'void', 'delete', 'yield', 'import', 'export',
 ]);
 
 // Keyword aliases: these lex to the token type of their canonical keyword so
@@ -17,15 +24,16 @@ const KW_ALIAS = { function: 'fn', const: 'let', var: 'let' };
 // Multi-char operators first so the longest match wins (the scan below returns
 // the first op that matches at the cursor, so 3-char must precede 2-char, etc).
 const OPS = [
-  '<<=', '>>=',
-  '==', '!=', '<=', '>=', '&&', '||', '<<', '>>', '++', '--',
-  '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
+  '...',
+  '<<=', '>>=', '===', '!==', '**=',
+  '==', '!=', '<=', '>=', '&&', '||', '<<', '>>', '++', '--', '**', '?.', '??',
+  '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '=>',
   '+', '-', '*', '/', '%', '=', '<', '>', '!', '&', '|', '^', '?', ':', '.',
   '(', ')', '{', '}', '[', ']', ',', ';',
 ];
 
-function isIdentStart(c) { return /[A-Za-z_]/.test(c); }
-function isIdentPart(c) { return /[A-Za-z0-9_]/.test(c); }
+function isIdentStart(c) { return /[A-Za-z_$]/.test(c); }
+function isIdentPart(c) { return /[A-Za-z0-9_$]/.test(c); }
 function isDigit(c) { return c >= '0' && c <= '9'; }
 
 function lex(src) {
@@ -51,17 +59,110 @@ function lex(src) {
       continue;
     }
 
-    // numbers (int or float)
+    // numbers (int, float, exponent, hex, or BigInt literal)
     if (isDigit(c)) {
       let s = '';
+      if (src[i] === '0' && (src[i + 1] === 'x' || src[i + 1] === 'X')) {
+        s += src[i]; adv(); s += src[i]; adv();
+        while (i < N && /[0-9a-fA-F]/.test(src[i])) { s += src[i]; adv(); }
+        if (src[i] === 'n') adv(); // BigInt suffix
+        push('num', parseInt(s, 16));
+        continue;
+      }
       while (i < N && (isDigit(src[i]) || src[i] === '.')) { s += src[i]; adv(); }
+      // exponent part, e.g. 1e6 or 1.5e-3
+      if (src[i] === 'e' || src[i] === 'E') {
+        s += src[i]; adv();
+        if (src[i] === '+' || src[i] === '-') { s += src[i]; adv(); }
+        while (i < N && isDigit(src[i])) { s += src[i]; adv(); }
+      }
+      if (src[i] === 'n') adv(); // BigInt suffix: value kept as a Number (best effort)
       push('num', parseFloat(s));
       continue;
     }
 
-    // strings
-    if (c === '"' || c === "'") {
+    // strings (support single, double and backtick-delimited templates)
+    if (c === '"' || c === "'" || c === '`') {
       const quote = c; adv();
+      // Handle template literals with embedded `${...}` expressions (full nested support).
+      if (quote === '`') {
+        // emit a tpl_start token then a sequence of str and tpl_expr_start/tpl_expr_end tokens, then tpl_end
+        push('tpl_start', null);
+        let buf = '';
+        while (i < N) {
+          if (src.startsWith('`', i)) { // end of template
+            if (buf.length) { push('str', buf); buf = ''; }
+            adv(); // consume `
+            push('tpl_end', null);
+            break;
+          }
+          if (src.startsWith('${', i)) {
+            // flush buffer as string token
+            if (buf.length) { push('str', buf); buf = ''; }
+            adv(2); // consume ${
+            push('tpl_expr_start', null);
+            // lex inner expression until matching } (track nested braces)
+            let braceDepth = 0;
+            while (i < N) {
+              const ch = src[i];
+              if (ch === '\"' || ch === "'" || ch === '`') {
+                // reuse string handling inside expression
+                const q = ch; adv(); let ss = '';
+                while (i < N && src[i] !== q) {
+                  if (src[i] === '\\') { adv(); ss += src[i]; adv(); } else { ss += src[i]; adv(); }
+                }
+                if (src[i] === q) adv(); push('str', ss);
+                continue;
+              }
+              if (ch === '/' && src[i+1] !== '/' && src[i+1] !== '*') {
+                // heuristic: handle regex start inside expression
+                const n1 = src[i+1];
+                if (n1 === '^' || n1 === '[' || n1 === '(' || n1 === '\\') {
+                  adv(); let pat = '', esc = false, inClass = false;
+                  while (i < N) {
+                    const ch2 = src[i];
+                    if (!esc && ch2 === '/' && !inClass) break;
+                    if (ch2 === '\\' && !esc) { esc = true; pat += ch2; adv(); continue; }
+                    if (!esc) { if (ch2 === '[') inClass = true; else if (ch2 === ']') inClass = false; }
+                    esc = false; pat += ch2; adv();
+                  }
+                  if (src[i] === '/') adv(); let flags = ''; while (i < N && /[gimuy]/.test(src[i])) { flags += src[i]; adv(); }
+                  push('regex', { pattern: pat, flags: flags });
+                  continue;
+                }
+              }
+              if (src[i] === '{') { braceDepth++; push('op', '{'); adv(); continue; }
+              if (src[i] === '}') {
+                if (braceDepth === 0) { adv(); push('tpl_expr_end', null); break; }
+                braceDepth--; push('op', '}'); adv(); continue;
+              }
+              // reuse main loop's handling for identifiers, numbers, ops etc inside expression
+              // whitespace
+              if (src[i] === ' ' || src[i] === '\t' || src[i] === '\r' || src[i] === '\n') { adv(); continue; }
+              // line comments and block comments
+              if (src[i] === '/' && src[i+1] === '/') { while (i < N && src[i] !== '\n') adv(); continue; }
+              if (src[i] === '/' && src[i+1] === '*') { adv(2); while (i < N && !(src[i] === '*' && src[i+1] === '/')) adv(); adv(2); continue; }
+              // numbers
+              if (/[0-9]/.test(src[i])) { let s = ''; while (i < N && (/[0-9]/.test(src[i]) || src[i] === '.')) { s += src[i]; adv(); } push('num', parseFloat(s)); continue; }
+              // identifiers / keywords
+              if (/[A-Za-z_]/.test(src[i])) { let s = ''; while (i < N && /[A-Za-z0-9_]/.test(src[i])) { s += src[i]; adv(); } const kw = KEYWORDS.has(s) ? (KW_ALIAS[s] || s) : 'ident'; push(kw, s); continue; }
+              // operators
+              let matched2 = null;
+              for (const op of OPS) { if (src.startsWith(op, i)) { matched2 = op; break; } }
+              if (matched2) { push('op', matched2); adv(matched2.length); continue; }
+              // anything else: consume char into buffer to avoid infinite loop
+              buf += src[i]; adv();
+            }
+            continue;
+          }
+          // normal character into buffer, allow escapes
+          if (src[i] === '\\') { adv(); if (i < N) { buf += src[i]; adv(); } continue; }
+          buf += src[i]; adv();
+        }
+        continue;
+      }
+
+      // non-template single/double quoted string
       let s = '';
       while (i < N && src[i] !== quote) {
         if (src[i] === '\\') {
@@ -72,7 +173,8 @@ function lex(src) {
           adv();
         } else { s += src[i]; adv(); }
       }
-      adv(); // closing quote
+      // closing quote
+      if (src[i] === quote) adv();
       push('str', s);
       continue;
     }
@@ -105,7 +207,55 @@ function lex(src) {
       continue;
     }
 
-    // operators
+    // operators and a lightweight regex literal heuristic
+    // A leading '/' is a regex only where an expression may *begin*; after a
+    // value (identifier, literal, or a closing ')'/']') it is division. This is
+    // the standard lex-time disambiguation and keeps `a / b` from being mistaken
+    // for a regex while still recognising `x.replace(/re/, ...)`.
+    const prevTok = toks[toks.length - 1];
+    const regexAllowed = !prevTok || !(
+      prevTok.type === 'ident' || prevTok.type === 'num' || prevTok.type === 'str' ||
+      prevTok.type === 'regex' || prevTok.type === 'true' || prevTok.type === 'false' ||
+      prevTok.type === 'null' || (prevTok.type === 'op' && (prevTok.value === ')' || prevTok.value === ']'))
+    );
+    if (regexAllowed && c === '/' && src[i + 1] !== '/' && src[i + 1] !== '*') {
+      // Scan ahead for an unescaped closing '/', tracking [...] character classes
+      // (where '/' is literal) and stopping at a newline (regex literals are
+      // single-line). Only if a well-formed literal is found do we emit a regex.
+      let j = i + 1; let esc = false; let found = false; let inClass = false;
+      while (j < N) {
+        const ch = src[j];
+        if (ch === '\n') break; // regex literals do not span lines
+        if (esc) { esc = false; j++; continue; }
+        if (ch === '\\') { esc = true; j++; continue; }
+        // '/' inside a [...] character class does not close the literal
+        if (ch === '[') inClass = true;
+        else if (ch === ']') inClass = false;
+        else if (ch === '/' && !inClass) { found = true; break; }
+        j++;
+      }
+      if (found) {
+        adv(); // consume '/'
+        let pat = '';
+        esc = false; inClass = false;
+        while (i < N) {
+          const ch = src[i];
+          if (!esc && ch === '/' && !inClass) break;
+          if (ch === '\\' && !esc) { esc = true; pat += ch; adv(); continue; }
+          if (!esc) { if (ch === '[') inClass = true; else if (ch === ']') inClass = false; }
+          esc = false;
+          pat += ch;
+          adv();
+        }
+        if (src[i] === '/') adv(); // closing slash
+        // optional flags
+        let flags = '';
+        while (i < N && /[gimuy]/.test(src[i])) { flags += src[i]; adv(); }
+        push('regex', { pattern: pat, flags: flags });
+        continue;
+      }
+    }
+
     let matched = null;
     for (const op of OPS) {
       if (src.startsWith(op, i)) { matched = op; break; }

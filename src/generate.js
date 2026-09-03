@@ -21,6 +21,8 @@ function resolveConfig(options = {}) {
     optimize: pick('optimize'),
     permute: pick('permute'),
     conceal: pick('conceal'),
+    dud: pick('dud'),
+    dudCount: options.dudCount,
     maxSteps: pick('maxSteps'),
     maxDepth: pick('maxDepth'),
     arch: options.arch || base.arch,
@@ -40,6 +42,8 @@ function generate(source, options = {}) {
     optimized: cfg.optimize,
     permute: cfg.permute,
     conceal: cfg.conceal,
+    dud: cfg.dud,
+    dudCount: cfg.dudCount,
     limited,
     signKey: options.sign,
   });

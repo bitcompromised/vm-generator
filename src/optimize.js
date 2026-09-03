@@ -77,6 +77,7 @@ function foldBin(op, x, y) {
 
 // ---- expression optimization ----
 function optExpr(e) {
+  if (!e) return e; // uninitialized `let` has a null value
   switch (e.type) {
     case 'Unary': {
       const arg = optExpr(e.arg);
@@ -148,6 +149,7 @@ function optStmt(s) {
       finalizer: s.finalizer ? { type: 'Block', body: optSeq(s.finalizer.body) } : null,
     }];
     case 'Break': case 'Continue': return [s];
+    case 'Seq': return [{ type: 'Seq', body: s.body.flatMap(optStmt) }];
     case 'Block': return [{ type: 'Block', body: optSeq(s.body) }];
     case 'If': {
       const test = optExpr(s.test);
@@ -230,6 +232,14 @@ function substReads(node, consts) {
     return { ...consts[node.name] };
   }
   if (node.type === 'FnDecl') return node; // do not cross into nested scope
+  // Never rewrite an assignment target into a literal (it must stay an lvalue);
+  // only substitute reads within the value and within Member/Index sub-expressions.
+  if (node.type === 'Assign') {
+    let target = node.target;
+    if (target && target.type === 'Member') target = { ...target, object: substReads(target.object, consts) };
+    else if (target && target.type === 'Index') target = { ...target, object: substReads(target.object, consts), index: substReads(target.index, consts) };
+    return { ...node, target, value: substReads(node.value, consts) };
+  }
   for (const k of Object.keys(node)) {
     const v = node[k];
     if (Array.isArray(v)) node[k] = v.map((x) => substReads(x, consts));

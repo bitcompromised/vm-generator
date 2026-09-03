@@ -58,11 +58,27 @@ const OPCODES = [
   ['CLOSURE',        ['u16']],   // build a closure over functions[idx], capturing upvalues
   ['LOAD_UP',        ['u16']],   // push upvalue[slot]
   ['STORE_UP',       ['u16']],   // upvalue[slot] = pop()
+  ['LOAD_UPVALUE',   ['u16']],   // push upvalue by name (consts[idx]) => cell.v
+  ['STORE_UPVALUE',  ['u16']],   // upvalue by name (consts[idx]) = pop()
+  ['CLOSE_UPVALUE',  ['u16']],   // ensure local slot is closed into a heap cell
   ['CALL_VALUE',     ['u8']],    // call a closure value with argc args (callee below args)
+  // ---- method / this support ----
+  ['LOAD_THIS',      []],        // push current frame's this binding
+  ['CALL_METHOD',    ['u8']],    // call a method with receiver below callee and argc args
+  ['NEW',            ['u16','u8']], // new fnIdx argc -> alloc instance, set proto, call ctor
+  ['NEW_VALUE',      ['u8']],    // new <value>(argc) -> callee is value on stack
   // ---- exceptions ----
   ['TRY',            ['u16']],   // install a catch handler at addr
   ['END_TRY',        []],        // remove the top catch handler
   ['THROW',          []],        // throw pop()
+  // ---- superinstructions (instruction-set polymorphism) ----
+  // Each fuses a common (load/const, op) pair. Per build their emitted bytes are
+  // randomized like every other opcode, so the fused forms differ each build.
+  ['LOADADD',        ['u16']],   // = LOAD slot ; ADD
+  ['LOADSUB',        ['u16']],   // = LOAD slot ; SUB
+  ['LOADLT',         ['u16']],   // = LOAD slot ; LT
+  ['CONSTADD',       ['u16']],   // = PUSH_CONST idx ; ADD
+  ['AWAIT',          []],
 ];
 
 const OP = {};

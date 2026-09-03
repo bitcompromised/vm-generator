@@ -195,8 +195,64 @@ ${opConstBlock()}
   }
   function truthy(v) { return !(v === null || v === undefined || v === false || v === 0 || v === ''); }
   function u32of(n) { return n >>> 0; }
-  function idxGet(obj, key) { if (isObj(obj)) return obj.get(key); if (Array.isArray(obj)) return obj[key]; if (typeof obj === 'string') return obj.charAt(key); throw new Error('cannot index ' + toStr(obj)); }
-  function idxSet(obj, key, val) { if (isObj(obj)) { obj.set(key, val); return; } if (Array.isArray(obj)) { obj[key] = val; return; } throw new Error('cannot assign index of ' + toStr(obj)); }
+  function idxGet(obj, key) {
+    if (isObj(obj)) return obj.get(key);
+    if (Array.isArray(obj)) return obj[key];
+    if (typeof obj === 'string') { if (key === 'length') return obj.length; return obj[key]; }
+    if (obj === null || obj === undefined) throw new Error('cannot index ' + toStr(obj));
+    return obj[key]; // native object / function / number
+  }
+  function idxSet(obj, key, val) {
+    if (isObj(obj)) { obj.set(key, val); return; }
+    if (Array.isArray(obj)) { obj[key] = val; return; }
+    if (obj && (typeof obj === 'object' || typeof obj === 'function')) { obj[key] = val; return; }
+    throw new Error('cannot assign index of ' + toStr(obj));
+  }
+
+  // Shared global environment + host globals (real JS built-ins by name).
+  var __globals = Object.create(null);
+  var __hostg = {
+    undefined: undefined, NaN: NaN, Infinity: Infinity, globalThis: (typeof globalThis !== 'undefined' ? globalThis : undefined), console: console,
+    Object: Object, Array: Array, Math: Math, JSON: JSON, Number: Number, String: String, Boolean: Boolean,
+    Promise: Promise, Map: Map, Set: Set, WeakMap: (typeof WeakMap !== 'undefined' ? WeakMap : undefined), WeakSet: (typeof WeakSet !== 'undefined' ? WeakSet : undefined),
+    Symbol: (typeof Symbol !== 'undefined' ? Symbol : undefined), Proxy: (typeof Proxy !== 'undefined' ? Proxy : undefined), Reflect: (typeof Reflect !== 'undefined' ? Reflect : undefined),
+    RegExp: RegExp, Date: Date, Error: Error, TypeError: TypeError, RangeError: RangeError,
+    parseInt: parseInt, parseFloat: parseFloat, isNaN: isNaN, isFinite: isFinite,
+    process: (typeof process !== 'undefined' ? process : undefined), Buffer: (typeof Buffer !== 'undefined' ? Buffer : undefined),
+    setTimeout: (typeof setTimeout !== 'undefined' ? setTimeout : undefined)
+  };
+  function __requireBridge(spec) {
+    try {
+      var path = require('path');
+      var base = (typeof __REQUIRE_BASE__ === 'string' && __REQUIRE_BASE__) ? __REQUIRE_BASE__ : process.cwd();
+      if (spec && (spec.indexOf('./') === 0 || spec.indexOf('../') === 0 || spec.indexOf('/') === 0 || /^[A-Za-z]:[\\\\/]/.test(spec))) return require(path.resolve(base, spec));
+      return require(spec);
+    } catch (e) { try { return require(spec); } catch (e2) { return undefined; } }
+  }
+  function __typeof(v) {
+    if (v === undefined) return 'undefined';
+    if (v === null) return 'object';
+    if (isClosure(v) || typeof v === 'function') return 'function';
+    if (Array.isArray(v) || isObj(v)) return 'object';
+    return typeof v;
+  }
+  function __instanceof(o, c) {
+    if (typeof c === 'function') { try { return o instanceof c; } catch (e) { return false; } }
+    if (isObj(c) && c.get('__isClass')) { var k = isObj(o) ? o.__classRef : null; while (k && isObj(k)) { if (k === c) return true; k = k.get('__super'); } return false; }
+    return false;
+  }
+  function __newObj(args) {
+    var cls = args[0], rest = args.slice(1);
+    if (typeof cls === 'function') { try { return new (Function.prototype.bind.apply(cls, [null].concat(rest)))(); } catch (e) { return null; } }
+    if (isObj(cls) && cls.get('__isClass')) {
+      var inst = new VMObj(); inst.__classRef = cls;
+      var chain = [], c = cls;
+      while (c && isObj(c) && c.get('__isClass')) { chain.unshift(c); c = c.get('__super'); }
+      for (var i = 0; i < chain.length; i++) { var m = chain[i].get('__methods'); if (isObj(m)) for (var j = 0; j < m.keys.length; j++) inst.set(m.keys[j], m.map[m.keys[j]]); }
+      return inst; // best-effort: VM-class constructor body is not run in the standalone VM
+    }
+    return null;
+  }
 
   function host(name, args) {
     switch (name) {
@@ -208,8 +264,24 @@ ${opConstBlock()}
       case 'rand': return Math.random();
       case 'time': return Date.now();
       case 'push': args[0].push(args[1]); return args[0];
-      case 'keys': return isObj(args[0]) ? args[0].keys.slice() : [];
+      case 'keys': return isObj(args[0]) ? args[0].keys.slice() : (args[0] && typeof args[0] === 'object' ? Object.keys(args[0]) : []);
       case 'has': return isObj(args[0]) ? args[0].has(args[1]) : false;
+      case '__setglobal': __globals[args[0]] = args[1]; return args[1];
+      case '__getglobal': {
+        var nm = args[0];
+        if (Object.prototype.hasOwnProperty.call(__globals, nm)) return __globals[nm];
+        if (nm === 'require') return __requireBridge;
+        if (Object.prototype.hasOwnProperty.call(__hostg, nm)) return __hostg[nm];
+        return undefined;
+      }
+      case 'typeof': return __typeof(args[0]);
+      case 'bitnot': return ~(Number(args[0]) || 0);
+      case 'pow': return Math.pow(args[0], args[1]);
+      case 'instanceof': return __instanceof(args[0], args[1]);
+      case 'inop': { var k = args[0], o = args[1]; if (isObj(o)) return o.has(k); if (Array.isArray(o)) return Number(k) >= 0 && Number(k) < o.length; if (o && typeof o === 'object') return k in o; return false; }
+      case 'require': return __requireBridge(args[0]);
+      case '__new': return __newObj(args);
+      case '__regex': { try { return new RegExp(args[0], args[1] || ''); } catch (e) { return null; } }
       default: throw new Error('unknown host builtin ' + name);
     }
   }
@@ -290,6 +362,7 @@ ${opConstBlock()}
             var vargs = new Array(vargc);
             for (var vk = vargc - 1; vk >= 0; vk--) vargs[vk] = stack.pop();
             var vcallee = stack.pop();
+            if (typeof vcallee === 'function' && !isClosure(vcallee)) { stack.push(vcallee.apply(null, vargs)); break; }
             if (!isClosure(vcallee)) throw new Error('value is not callable: ' + toStr(vcallee));
             var vfn = fns[vcallee.fn];
             var vlocals = mkCells(vfn.nlocals);
@@ -298,6 +371,28 @@ ${opConstBlock()}
             frame = { fn: vfn, ip: 0, locals: vlocals, upvals: vcallee.upvals };
             break;
           }
+          case OP.LOAD_THIS: { stack.push(frame.thisObj !== undefined ? frame.thisObj : null); break; }
+          case OP.CALL_METHOD: {
+            var margc = rd8();
+            var margs = new Array(margc);
+            for (var mk = margc - 1; mk >= 0; mk--) margs[mk] = stack.pop();
+            var mcallee = stack.pop();
+            var mrecv = stack.pop();
+            if (typeof mcallee === 'function' && !isClosure(mcallee)) { stack.push(mcallee.apply(mrecv, margs)); break; }
+            if (!isClosure(mcallee)) throw new Error('value is not callable: ' + toStr(mcallee));
+            var mfn = fns[mcallee.fn];
+            var mlocals = mkCells(mfn.nlocals);
+            for (var mk2 = 0; mk2 < margc; mk2++) mlocals[mk2].v = margs[mk2];
+            frames.push(frame);
+            frame = { fn: mfn, ip: 0, locals: mlocals, upvals: mcallee.upvals, thisObj: mrecv };
+            break;
+          }
+          case OP.AWAIT: { stack.push(stack.pop()); break; } // synchronous VM: best-effort passthrough
+          case OP.CLOSE_UPVALUE: { rd16(); break; } // locals are already heap cells
+          case OP.LOADADD: { var laI = rd16(); var laX = stack.pop(), laB = frame.locals[laI].v; stack.push((typeof laX === 'number' && typeof laB === 'number') ? laX + laB : toStr(laX) + toStr(laB)); break; }
+          case OP.LOADSUB: { var lsI = rd16(); stack.push(stack.pop() - frame.locals[lsI].v); break; }
+          case OP.LOADLT: { var llI = rd16(); stack.push(stack.pop() < frame.locals[llI].v); break; }
+          case OP.CONSTADD: { var caI = rd16(); var caX = stack.pop(), caB = consts[caI]; stack.push((typeof caX === 'number' && typeof caB === 'number') ? caX + caB : toStr(caX) + toStr(caB)); break; }
           case OP.CLOSURE: {
             var cidx = rd16();
             var cfn = fns[cidx];

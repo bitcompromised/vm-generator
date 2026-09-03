@@ -308,8 +308,19 @@ local function idxSet(obj, key, val)
   else error('cannot assign index of ' .. toStr(obj)) end
 end
 
+local globals = {}
 local function host(name, args)
-  if name == 'len' then local a = args[0]; if isArr(a) then return a.n elseif isObj(a) then return a.keys.n else return #tostring(a) end
+  if name == '__setglobal' then globals[args[0]] = args[1]; return args[1]
+  elseif name == '__getglobal' then local v = globals[args[0]]; if v == nil then return NULL else return v end
+  elseif name == 'typeof' then local v = args[0]; if v == nil or v == NULL then return 'undefined' elseif type(v) == 'number' then return 'number' elseif type(v) == 'string' then return 'string' elseif type(v) == 'boolean' then return 'boolean' else return 'object' end
+  elseif name == 'bitnot' then return -1 - (tonumber(args[0]) or 0)
+  elseif name == 'pow' then return (tonumber(args[0]) or 0) ^ (tonumber(args[1]) or 0)
+  elseif name == 'instanceof' then return false
+  elseif name == 'inop' then return false
+  elseif name == 'require' then return NULL
+  elseif name == '__new' then return NULL
+  elseif name == '__regex' then return NULL
+  elseif name == 'len' then local a = args[0]; if isArr(a) then return a.n elseif isObj(a) then return a.keys.n else return #tostring(a) end
   elseif name == 'str' then return toStr(args[0])
   elseif name == 'num' then return tonumber(args[0])
   elseif name == 'floor' then return floor(args[0])
