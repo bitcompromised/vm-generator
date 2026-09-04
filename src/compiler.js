@@ -13,7 +13,7 @@
 // visible to every closure over the same variable, and the variable survives
 // after the defining function returns.
 
-const { OP, OP_OPERANDS } = require('./opcodes');
+const { OP, OP_OPERANDS, OP_NAME } = require('./opcodes');
 const { parse } = require('./parser');
 const { optimize } = require('./optimize');
 const { expandImports, hasImports } = require('./modules');
@@ -181,6 +181,9 @@ class Compiler {
     // Global protection floor applied to EVERY function (per-function <@...>
     // directives merge on top and win). Shape: { flatten, bogus, split, protLevel }.
     this.globalProt = opts.globalProt || null;
+    // Per-function overrides keyed by global function index (from the UI / API).
+    // Precedence: inline directive > per-function override > global floor.
+    this.perFnProt = opts.perFnProt || null;
     // Deterministic RNG for the obfuscation transforms (seeded so builds repeat).
     let s = ((opts.seed !== undefined ? opts.seed : 0x2545f491) ^ 0x6b43a9b5) >>> 0;
     this.transformRng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
@@ -225,6 +228,7 @@ class Compiler {
     // compile main
     const main = new FnEmitter('$main', [], this, null);
     main.isMain = true; // top-level `let` binds into the global environment
+    main.globalIndex = 0;
     for (const s of topStmts) this.compileStmt(main, s);
     main.emit(OP.HALT);
     this.functions[0] = this.finishFn(main);
@@ -232,6 +236,7 @@ class Compiler {
     // compile each top-level function
     for (const { idx, stmt } of topFns) {
       const fe = new FnEmitter(stmt.name, stmt.params, this, null);
+      fe.globalIndex = idx;
       fe.protLevel = stmt.protLevel; // selective-virtualization annotation (may be undefined)
       fe.prot = stmt.prot;           // per-pass modification knobs (flat/bogus/split/...)
       fe.restParam = stmt.restParam;
@@ -257,6 +262,7 @@ class Compiler {
     const idx = this.functions.length;
     this.functions.push(null); // reserve the slot before compiling the body
     const fe = new FnEmitter(node.name || '$anon', node.params, this, parentFe);
+    fe.globalIndex = idx;
     fe.protLevel = node.protLevel; // selective-virtualization annotation (may be undefined)
     fe.prot = node.prot;           // per-pass modification knobs (flat/bogus/split/...)
     fe.restParam = node.restParam;
@@ -305,12 +311,21 @@ class Compiler {
     // {pos}-labelled instruction array before offsets are resolved.
     // Merge the global protection floor with any per-function directive (the
     // directive wins on conflict), so `--flatten-all` etc. reach every function.
-    let eprot = fe.prot;
-    if (this.globalProt) eprot = Object.assign({}, this.globalProt, fe.prot || {});
+    // Effective protection = global floor, then per-function override, then the
+    // inline directive (each later layer wins).
+    let eprot = Object.assign({}, this.globalProt || {});
+    if (this.perFnProt && this.perFnProt[fe.globalIndex]) eprot = Object.assign(eprot, this.perFnProt[fe.globalIndex]);
+    if (fe.prot) eprot = Object.assign(eprot, fe.prot);
     fe.prot = eprot; // reflect effective settings in the build report
+    fe.effProtLevel = eprot.protLevel; // may be undefined
+    let preTransformOps = null;
     if (eprot && (eprot.bogus || eprot.split || eprot.flatten)) {
+      // snapshot the canonical opcode sequence BEFORE transforms so the build
+      // summary can show exactly what <@flat>/<@bogus>/<@split> added.
+      preTransformOps = instrs.map((x) => OP_NAME[x.op]);
       instrs = applyTransforms(instrs, eprot, this.transformRng);
     }
+    fe.preTransformOps = preTransformOps;
 
     // Optional superinstruction fusion. Done here, before offsets are computed,
     // with jump targets protected so control flow is preserved exactly.
@@ -344,9 +359,9 @@ class Compiler {
       upvals: fe.upvals.map((u) => ({ fromLocal: u.fromLocal, index: u.index, name: u.name })),
       // map handler label refs into concrete addresses and export metadata
       handlers: fe.handlers.map((h) => ({ addr: offsets[h.handlerLabel.pos], hasCatch: h.hasCatch, catchName: h.catchName, hasFinalizer: h.hasFinalizer })),
-      // cipher rounds: explicit directive wins, else the global floor, else weak(1)
+      // cipher rounds: explicit directive wins, else per-fn/global floor, else weak(1)
       protLevel: (fe.protLevel != null) ? fe.protLevel
-        : (this.globalProt && this.globalProt.protLevel != null ? this.globalProt.protLevel : 1),
+        : (fe.effProtLevel != null ? fe.effProtLevel : 1),
       prot: fe.prot || null, // per-pass modification knobs (for build reporting)
       restParam: (fe.restParam != null) ? fe.restParam : null,
       generator: !!fe.generator,
@@ -355,6 +370,7 @@ class Compiler {
       localNames: fe.localNames,
       origInstrCount,
       finalInstrCount: instrs.length,
+      preTransformOps: fe.preTransformOps, // canonical ops before CF passes (for summary)
     };
   }
 
@@ -893,7 +909,7 @@ function compile(src, opts = {}) {
   // Global string encryption runs AFTER optimization (so constant folding can't
   // re-collapse the reconstructed literals) but before codegen.
   if (opts.encStr && opts.encStr !== 'none') ast = encryptStrings(ast, opts.encStr, opts.seed);
-  const c = new Compiler({ fuse: opts.fuse, useEnvObjects: !!opts.useEnvObjects, seed: opts.seed, globalProt: opts.globalProt });
+  const c = new Compiler({ fuse: opts.fuse, useEnvObjects: !!opts.useEnvObjects, seed: opts.seed, globalProt: opts.globalProt, perFnProt: opts.perFnProt });
   const program = c.compileProgram(ast);
   program.encStrCount = ast._encStrCount || 0;
   program.upvalueMode = c.useEnvObjects ? 'env' : 'cells';

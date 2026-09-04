@@ -277,6 +277,9 @@ function parse(src) {
     if (t.type === 'if') return parseIf();
     if (t.type === 'while') return parseWhile();
     if (t.type === 'for') return parseFor();
+    // `switch` is a contextual keyword (ordinary identifier in the lexer): only a
+    // `switch (` opener starts a switch statement, so `switch` stays usable as a name.
+    if (t.type === 'ident' && t.value === 'switch' && toks[p + 1] && toks[p + 1].type === 'op' && toks[p + 1].value === '(') return parseSwitch();
     if (t.type === 'break') { eat('break'); if (atOp(';')) eatOp(';'); return { type: 'Break' }; }
     if (t.type === 'continue') { eat('continue'); if (atOp(';')) eatOp(';'); return { type: 'Continue' }; }
     if (t.type === 'try') return parseTry();
@@ -574,7 +577,7 @@ function parse(src) {
       next(); // consume of/in
       const iter = parseExpr();
       eatOp(')');
-      const body = parseBlock();
+      const body = parseBody();
       // Desugar to an index loop over a snapshot of the iterable. `len`/index
       // access cover arrays and strings; `for-in` yields keys via `keys()`.
       const s = freshTmp(), i = freshTmp();
@@ -605,7 +608,7 @@ function parse(src) {
     let update = null;
     if (!atOp(')')) update = parseSimple();
     eatOp(')');
-    const body = parseBlock();
+    const body = parseBody();
     return { type: 'For', init, test, update, body };
   }
 
@@ -699,9 +702,20 @@ function parse(src) {
   function parseReturn() {
     eat('return');
     let value = null;
-    if (!atOp(';') && !atOp('}') && !at('else') && !at('catch') && !at('finally') && !at('eof')) value = parseExpr();
+    // Automatic semicolon insertion: `return` is a restricted production -- a
+    // newline right after it terminates the statement (bare return), so
+    //   if (x) return
+    //   this.y = 1
+    // does NOT parse as `return this.y`.
+    if (!toks[p].nl && !atOp(';') && !atOp('}') && !at('else') && !at('catch') && !at('finally') && !at('eof')) value = parseExpr();
     if (atOp(';')) eatOp(';');
     return { type: 'Return', value };
+  }
+
+  // Parse a loop / clause body: either a `{ ... }` block or a single statement
+  // (wrapped in a Block so downstream passes always see one). Mirrors parseIf.
+  function parseBody() {
+    return atOp('{') ? parseBlock() : { type: 'Block', body: [parseStatement()] };
   }
 
   function parseIf() {
@@ -725,8 +739,64 @@ function parse(src) {
     eatOp('(');
     const test = parseExpr();
     eatOp(')');
-    const body = parseBlock();
+    const body = parseBody();
     return { type: 'While', test, body };
+  }
+
+  // switch(disc){ case A: ... default: ... } -- desugared to a discriminant temp,
+  // an entry-index computation (first matching case, else default, else past-end),
+  // and a one-shot loop whose bodies run from the entry index onward (so C-style
+  // fall-through works) and whose `break` exits the switch. `switch`/`case`/
+  // `default` are ordinary identifiers in the lexer, matched contextually here.
+  function parseSwitch() {
+    next(); // 'switch'
+    eatOp('(');
+    const disc = parseExpr();
+    eatOp(')');
+    eatOp('{');
+    const clauses = []; // { test: expr | null(default), body: [stmt] }
+    while (!atOp('}') && !at('eof')) {
+      if (at('ident', 'case')) { next(); const test = parseExpr(); eatOp(':'); clauses.push({ test, body: [] }); }
+      else if (at('ident', 'default')) { next(); eatOp(':'); clauses.push({ test: null, body: [] }); }
+      else {
+        if (clauses.length === 0) throw new SyntaxError(`Unexpected statement before first case at line ${toks[p].line}`);
+        clauses[clauses.length - 1].body.push(parseStatement());
+      }
+    }
+    eatOp('}');
+    return desugarSwitch(disc, clauses);
+  }
+
+  function desugarSwitch(disc, clauses) {
+    const d = freshTmp(), k = freshTmp(), once = freshTmp();
+    const LEN = clauses.length;
+    let defaultIdx = -1;
+    clauses.forEach((c, j) => { if (c.test === null) defaultIdx = j; });
+    const idn = (n) => ({ type: 'Ident', name: n });
+    const num = (v) => ({ type: 'Num', value: v });
+    const bin = (op, left, right) => ({ type: 'Binary', op, left, right });
+    const assign = (n, v) => ({ type: 'Assign', target: idn(n), value: v });
+    const out = [];
+    out.push({ type: 'Let', name: d, value: disc });
+    out.push({ type: 'Let', name: k, value: num(-1) });
+    // entry-index tests: first case whose value strictly-equals the discriminant
+    clauses.forEach((c, j) => {
+      if (c.test === null) return;
+      out.push({ type: 'If', test: bin('&&', bin('<', idn(k), num(0)), bin('===', idn(d), c.test)),
+        cons: { type: 'Block', body: [assign(k, num(j))] }, alt: null });
+    });
+    // no case matched -> default (if any), else past-end (nothing runs)
+    out.push({ type: 'If', test: bin('<', idn(k), num(0)),
+      cons: { type: 'Block', body: [assign(k, num(defaultIdx >= 0 ? defaultIdx : LEN))] }, alt: null });
+    // one-shot loop; bodies from k onward run (fall-through); `break` exits switch
+    const loopBody = clauses.map((c, j) => ({ type: 'If', test: bin('<=', idn(k), num(j)),
+      cons: { type: 'Block', body: c.body }, alt: null }));
+    out.push({ type: 'For',
+      init: { type: 'Let', name: once, value: num(0) },
+      test: bin('<', idn(once), num(1)),
+      update: assign(once, bin('+', idn(once), num(1))),
+      body: { type: 'Block', body: loopBody } });
+    return { type: 'Block', body: out };
   }
 
   function parsePrint() {

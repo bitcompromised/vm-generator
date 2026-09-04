@@ -168,6 +168,7 @@ Commands:
   disasm <file>       Print canonical (pre-protection) bytecode
   benchmark <file>    Measure compile/build/exec time, size, instruction counts
   interactive [file]  Interactive settings console (see below)
+  ui [file]           Local web control panel: per-function toggles + settings
 
 Options:
   -t, --target js|lua        Output language (default js)
@@ -190,6 +191,10 @@ Options:
       --conceal / --no-conceal   Store integers as unsolved XOR expressions
       --fuse / --no-fuse         Superinstruction (opcode) fusion
       --permute / --no-permute   Randomize the opcode table
+      --mutate-handlers          Shuffle the dispatch handlers each build
+      --loader-form <form>       VM loader shape: auto | compact | verbose | split
+      --prod / --production      Terse runtime errors (dev builds print the VM
+                                 position + host stack on an uncaught error)
       --max-objects <n>          Cap live object/array allocations (0 = off)
       --max-string <n>           Cap single-string length (0 = off)
 
@@ -206,6 +211,31 @@ Options:
 The `build` command also writes a detailed **`<out>_summary.txt`** log (disable
 with `--no-summary`) and prints a build report of config, per-function
 modifications, and statistics.
+
+---
+
+## Web control panel
+
+`vm-gen ui [file]` starts a local control panel (binds to `127.0.0.1` only, no
+data leaves the machine) at `http://127.0.0.1:7842/`:
+
+- **Analyze functions** lists every function with its scope — parameters, locals,
+  and captured upvalues **by name** — and flags any inline `<@…>` directives.
+- **Per-function protection**: toggle `flatten` / `split` / `bogus` (0–3) /
+  `cipher rounds` (0–3) on individual functions. These override the global
+  defaults for just that function; bulk actions apply one toggle to all.
+- Settings are split into two groups:
+  - **VM-interpreter** — how the engine itself is built: opcode permutation,
+    superinstruction fusion, integer concealment, default cipher rounds,
+    **mutate opcode handlers** (shuffle the dispatch per build), and **loader
+    form** (`auto`/`compact`/`verbose`/`split`).
+  - **VM-child** — how the guest program is protected: global flatten/bogus/split,
+    string encryption, decoy functions, symbol renaming, optimization.
+- **Build** shows the summary (including the *Added code* report), the emitted VM
+  source, live stats, and a **Download VM** button.
+
+Function indices track the current `optimize` setting, so re-analyze after
+toggling it. `vm-gen ui --port <n>` chooses a different port.
 
 ---
 

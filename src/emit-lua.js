@@ -451,6 +451,24 @@ local function run(prog)
       fp = fp + 1; frames[fp] = frame
       frame = { code = vfn.code, ip = 0, locals = locals, upvals = vcallee.upvals }
       code = frame.code; ip = 0
+    elseif op == OP.CALL_METHOD then
+      local margc = rd8()
+      if MAX_DEPTH > 0 and fp + 1 > MAX_DEPTH then error('resource limit: call depth exceeded') end
+      local mav = {}; for k = margc - 1, 0, -1 do mav[k] = pop() end
+      local mcallee = pop()
+      local mrecv = pop()
+      if not isClosure(mcallee) then error('value is not callable: ' .. toStr(mcallee)) end
+      local mfn = fns[mcallee.fn]
+      local locals = mkCells(mfn.nlocals)
+      local argsArr = newArr(margc); for k = 0, margc - 1 do argsArr[k] = mav[k] end
+      for k = 0, mfn.nparams - 1 do if k < margc then locals[k].v = mav[k] end end
+      if mfn.restParam ~= nil then local r = newArr(0); local ri = 0; for k = mfn.restParam, margc - 1 do r[ri] = mav[k]; ri = ri + 1 end; r.n = ri; locals[mfn.restParam].v = r end
+      frame.ip = ip
+      fp = fp + 1; frames[fp] = frame
+      frame = { code = mfn.code, ip = 0, locals = locals, upvals = mcallee.upvals, args = argsArr, thisObj = mrecv }
+      code = frame.code; ip = 0
+    elseif op == OP.CLOSE_UPVALUE then
+      rd16() -- locals are already heap cells in this VM; no capture-close needed
     elseif op == OP.CLOSURE then
       local cidx = rd16()
       local cfn = fns[cidx]

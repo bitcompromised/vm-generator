@@ -26,6 +26,8 @@ Usage:
   vm-gen exec      <source> [--trace]   Run on the reference interpreter (oracle)
   vm-gen disasm    <source>             Print canonical bytecode (pre-protection)
   vm-gen benchmark <source> [options]   Profile compile/build/run metrics
+  vm-gen ui        [source]             Launch the local web control panel
+  vm-gen interactive [source]           Terminal settings console
 
 <source> is a .vgs program or a .js file in the supported subset.
 
@@ -55,6 +57,9 @@ Options:
   --conceal, --no-conceal                Store integers as unsolved XOR expressions
   --fuse, --no-fuse                      Superinstruction (opcode) fusion
   --permute, --no-permute                Randomize the opcode table
+  --mutate-handlers                      Shuffle the dispatch handlers per build
+  --loader-form  <form>                  VM loader shape: auto | compact | verbose | split
+  --prod, --production                   Terse runtime errors (dev builds are verbose)
   --max-objects  <number>                Cap live object/array allocations (0 = off)
   --max-string   <number>                Cap single-string length (0 = off)
   --no-banner                            Omit the generated-file header comment
@@ -82,6 +87,7 @@ function parseArgs(argv) {
     else if (a === '--profile' || a === '-p') opts.profile = argv[++i];
     else if (a === '--out' || a === '-o') opts.out = argv[++i];
     else if (a === '--seed') opts.seed = parseInt(argv[++i], 10);
+    else if (a === '--port') opts.port = parseInt(argv[++i], 10);
     else if (a === '--max-steps') opts.maxSteps = parseInt(argv[++i], 10);
     else if (a === '--max-depth') opts.maxDepth = parseInt(argv[++i], 10);
     else if (a === '--sign') opts.sign = argv[++i];
@@ -106,9 +112,13 @@ function parseArgs(argv) {
     else if (a === '--no-fuse') opts.fuse = false;
     else if (a === '--permute') opts.permute = true;
     else if (a === '--no-permute') opts.permute = false;
+    else if (a === '--mutate-handlers') opts.mutateHandlers = true;
+    else if (a === '--no-mutate-handlers') opts.mutateHandlers = false;
+    else if (a === '--loader-form') opts.loaderForm = String(argv[++i] || '').toLowerCase();
     else if (a === '--max-objects') opts.maxObjects = parseInt(argv[++i], 10);
     else if (a === '--max-string') opts.maxString = parseInt(argv[++i], 10);
     else if (a === '--no-banner') opts.banner = false;
+    else if (a === '--prod' || a === '--production') opts.prod = true;
     else if (a === '--quiet' || a === '-q') opts.quiet = true;
     else if (a === '--no-summary') opts.summary = false;
     else if (a === '--no-rename') opts.renameSymbols = false;
@@ -219,6 +229,15 @@ async function main() {
     await interactiveBuild(cmd === 'interactive' || cmd === 'config' ? opts._[1] : cmd);
     return;
   }
+  // Local web UI: per-function protection toggles + interpreter/child settings.
+  if (cmd === 'ui') {
+    const { serve } = require('./ui-server');
+    const html = fs.readFileSync(path.join(__dirname, 'ui.html'), 'utf8');
+    const initial = opts._[1] ? path.resolve(unquote(opts._[1])) : '';
+    serve(html, opts.port || 7842, initial);
+    return;
+  }
+
   if (opts.help || !cmd) { usage(); return; }
 
   const file = opts._[1];
@@ -285,7 +304,8 @@ async function main() {
       // granular protection knobs (undefined => inherit from profile)
       flatten: opts.flatten, bogus: opts.bogus, split: opts.split, protLevel: opts.protLevel,
       encStr: opts.encStr, conceal: opts.conceal, fuse: opts.fuse, permute: opts.permute,
-      maxObjects: opts.maxObjects, maxString: opts.maxString,
+      maxObjects: opts.maxObjects, maxString: opts.maxString, prod: opts.prod,
+      mutateHandlers: opts.mutateHandlers, loaderForm: opts.loaderForm,
     });
     fs.writeFileSync(out, output);
     // Detailed build log (raw source, scope names, obfuscation, disassembly).

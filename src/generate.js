@@ -70,12 +70,37 @@ function buildSummary(program, source, cfg, meta, renameMap, mods, finalSource) 
   L.push('## Constant pool'); L.push(rule('-'));
   program.consts.forEach((c, i) => L.push(`  [${i}] ${typeof c === 'string' ? JSON.stringify(c) : c}`));
   L.push('');
-  L.push('## Code added by protection'); L.push(rule('-'));
+  L.push('## Added code (what protection generated)'); L.push(rule('-'));
   const addedByPass = program.functions.reduce((a, f) => a + ((f.finalInstrCount || 0) - (f.origInstrCount || 0)), 0);
-  L.push(`  obfuscation passes   +${addedByPass} instructions (flat/bogus/split/close-upvalue)`);
+  L.push(`  obfuscation passes   +${addedByPass} instructions total (flat/bogus/split/close-upvalue)`);
+  L.push('');
+  // Per-function: the concrete opcodes each pass ADDED, shown as a histogram of
+  // (post-transform opcodes) minus (pre-transform opcodes). This is the result of
+  // <@flat>/<@bogus>/<@split> on that function.
+  let anyAdded = false;
+  program.functions.forEach((fn, i) => {
+    if (!fn.preTransformOps) return;
+    const before = {}, after = {};
+    for (const n of fn.preTransformOps) before[n] = (before[n] || 0) + 1;
+    for (const ins of fn.instrs) { const n = OP_NAME[ins.op]; after[n] = (after[n] || 0) + 1; }
+    const added = [];
+    for (const n of Object.keys(after)) { const d = (after[n] || 0) - (before[n] || 0); if (d > 0) added.push(`${n} x${d}`); }
+    const p = fn.prot || {};
+    const passes = [p.flatten && 'flat', p.bogus && ('bogus:' + p.bogus), p.split && 'split'].filter(Boolean).join(', ');
+    const m = (mods[i] || {}).name || fn.name;
+    L.push(`  #${i} ${m}  [${passes}]  ${fn.preTransformOps.length} -> ${fn.instrs.length} instructions (+${fn.instrs.length - fn.preTransformOps.length})`);
+    if (added.length) L.push(`      added opcodes: ${added.join(', ')}`);
+    anyAdded = true;
+  });
+  if (!anyAdded) L.push('  (no control-flow passes active - enable <@flat>/<@bogus>/<@split> or --flatten/--bogus/--split)');
+  L.push('');
+  if (meta.encStrCount) {
+    L.push(`  string encryption    ${meta.encStrCount} literal(s) rewritten into runtime reconstruction code`);
+    L.push('                       (String.fromCharCode / Array.join expressions instead of plaintext)');
+  }
   if (meta.dudFns) {
     L.push(`  decoy functions      ${meta.dudFns} inert "dud" function(s) appended to the datastream:`);
-    L.push('                       - well-formed, permuted, RET-terminated bytecode');
+    L.push('                       - well-formed, permuted, RET-terminated bytecode (result of <@deadcode>/--dud)');
     L.push('                       - never referenced by any CALL/CLOSURE, so never run');
     L.push('                       - covered by the function-integrity domain like real code');
   } else {
@@ -93,11 +118,6 @@ function buildSummary(program, source, cfg, meta, renameMap, mods, finalSource) 
   L.push(`  image size          ${meta.imageSize} bytes`);
   L.push(`  checksum            0x${meta.checksum.toString(16)}  (+ 4 integrity domains)`);
   L.push('');
-  if (finalSource) {
-    L.push('## Final emitted VM source (' + (meta.target || 'js') + ')'); L.push(rule('-'));
-    L.push(finalSource.replace(/\s+$/, ''));
-    L.push('');
-  }
   return L.join('\n');
 }
 
@@ -187,7 +207,7 @@ function generate(source, options = {}) {
   const globalProt = { flatten: cfg.flatten, bogus: cfg.bogus, split: cfg.split, protLevel: cfg.protLevel };
   const program = compile(source, {
     optimize: cfg.optimize, resolveImport: options.resolveImport, fuse: cfg.fuse, seed: options.seed,
-    globalProt, encStr: cfg.encStr,
+    globalProt, encStr: cfg.encStr, perFnProt: options.perFnProt,
   });
   const limited = cfg.maxSteps > 0 || cfg.maxDepth > 0 || cfg.maxObjects > 0 || cfg.maxString > 0;
 
@@ -234,4 +254,36 @@ function generate(source, options = {}) {
   return { output: out, program, image, meta, config: cfg };
 }
 
-module.exports = { generate, compile, buildImage, disassemble, resolveConfig };
+// Analyze source into a per-function scope listing for the UI/API: every
+// function with its index (stable for a given `optimize` setting), original
+// name, parameters, locals and captured upvalues by name, plus any inline
+// protection directives already present. Build MUST use the same `optimize`
+// value for the indices to line up with per-function overrides.
+function analyze(source, options = {}) {
+  const optimize = options.optimize !== undefined ? options.optimize : false;
+  const program = compile(source, { optimize, resolveImport: options.resolveImport });
+  return {
+    optimize,
+    functions: program.functions.map((fn, i) => {
+      const names = fn.localNames || [];
+      const params = [];
+      const locals = [];
+      for (let s = 0; s < fn.nlocals; s++) {
+        const nm = names[s];
+        if (nm === undefined) continue;
+        (s < fn.nparams ? params : locals).push(nm);
+      }
+      return {
+        index: i,
+        name: fn.name === '$main' ? '(top-level)' : fn.name,
+        isMain: fn.name === '$main',
+        params, locals,
+        upvalues: (fn.upvals || []).map((u) => u.name).filter(Boolean),
+        async: !!fn.async, generator: !!fn.generator,
+        directives: fn.prot || null,
+      };
+    }),
+  };
+}
+
+module.exports = { generate, compile, buildImage, disassemble, resolveConfig, analyze };

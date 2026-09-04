@@ -36,6 +36,9 @@ ${opConstBlock()}
   var MAX_DEPTH = ${maxDepth};
   var MAX_OBJECTS = ${maxObjects};
   var MAX_STRING = ${maxString};
+  var __DEV = ${opts.prod ? 'false' : 'true'};
+  // last-executed VM position, for expanded diagnostics in dev builds
+  var __ectx = { fn: -1, ip: -1, op: -1, depth: 0 };
   var objCount = 0;
   function guardStr(s) { if (MAX_STRING && typeof s === 'string' && s.length > MAX_STRING) throw new Error('resource limit: string size exceeded'); return s; }
   function guardObj() { if (MAX_OBJECTS && ++objCount > MAX_OBJECTS) throw new Error('resource limit: object budget exceeded'); }
@@ -422,6 +425,7 @@ ${opConstBlock()}
     for (;;) {
       if (MAX_STEPS && ++steps > MAX_STEPS) throw new Error('resource limit: instruction budget exceeded');
       var op = b2c[rd8()];
+      if (__DEV) { __ectx.op = op; __ectx.ip = frame.ip; __ectx.depth = frames.length; __ectx.fn = frame.fn && frame.fn.name; }
       try {
         switch (op) {
           case OP.HALT: return undefined;
@@ -608,12 +612,77 @@ ${opConstBlock()}
   try {
     run(load());
   } catch (e) {
-    if (typeof console !== 'undefined') console.error('[vm-gen] ' + e.message);
+    if (typeof console !== 'undefined') {
+      if (__DEV) {
+        // Expanded diagnostics for development builds: message, the VM position
+        // where it failed, and the host stack trace. Suppressed in --prod builds.
+        console.error('[vm-gen] runtime error: ' + (e && e.message ? e.message : e));
+        console.error('[vm-gen]   at vm fn=' + __ectx.fn + ' ip=' + __ectx.ip + ' op=' + __ectx.op + ' depth=' + __ectx.depth);
+        if (e && e.stack) console.error('[vm-gen]   host stack:\\n' + e.stack);
+      } else {
+        console.error('[vm-gen] ' + (e && e.message ? e.message : e));
+      }
+    }
     if (typeof process !== 'undefined' && process.exit) process.exit(1);
   }
 })();
 `;
-  return minifySource(randomizeIdentifiers(src, opts), opts);
+  // Loader-form selection (#4): pick a structural "form" for the emitted VM. The
+  // forms are behaviour-identical; they differ in layout/complexity so the shape
+  // of the loader varies per build. 'auto' derives the form from the seed.
+  const formOpts = pickLoaderForm(opts);
+  return minifySource(randomizeIdentifiers(mutateHandlers(src, formOpts), formOpts), formOpts);
+}
+
+// Resolve loaderForm into concrete render toggles (mutateHandlers + minify).
+// Behaviour is unchanged across forms; only the emitted structure differs.
+function pickLoaderForm(opts) {
+  const o = Object.assign({}, opts);
+  let form = opts.loaderForm || 'auto';
+  if (form === 'auto') {
+    const s = ((opts.seed !== undefined ? opts.seed : (opts.salt || 0)) >>> 0) % 3;
+    form = ['compact', 'verbose', 'split'][s];
+  }
+  if (form === 'verbose') { o.minify = false; o.mutateHandlers = opts.mutateHandlers; }
+  else if (form === 'split') { o.mutateHandlers = true; if (o.minify === undefined) o.minify = true; }
+  else { /* compact */ o.mutateHandlers = opts.mutateHandlers; if (o.minify === undefined) o.minify = true; }
+  o._loaderForm = form;
+  return o;
+}
+
+// Handler mutation (#3): shuffle the dispatch switch's case blocks. Every case in
+// the emitted VM self-terminates (break/return), so their textual order carries
+// no semantics -- reordering them changes the handler layout every build without
+// affecting behaviour. Keyed by the build seed; a no-op unless mutateHandlers.
+function mutateHandlers(src, opts) {
+  if (!opts || !opts.mutateHandlers) return src;
+  const lines = src.split('\n');
+  const startIdx = lines.findIndex((l) => /switch \(op\) \{/.test(l));
+  if (startIdx < 0) return src;
+  // the region of case blocks runs from the first `case OP.` to just before `default:`
+  let defaultIdx = -1;
+  for (let i = startIdx + 1; i < lines.length; i++) { if (/^\s*default:/.test(lines[i])) { defaultIdx = i; break; } }
+  if (defaultIdx < 0) return src;
+  let firstCase = -1;
+  for (let i = startIdx + 1; i < defaultIdx; i++) { if (/^\s*case OP\./.test(lines[i])) { firstCase = i; break; } }
+  if (firstCase < 0) return src;
+  // split [firstCase, defaultIdx) into blocks that each begin with a `case OP.` line
+  const blocks = [];
+  let cur = null;
+  for (let i = firstCase; i < defaultIdx; i++) {
+    if (/^\s*case OP\./.test(lines[i])) { if (cur) blocks.push(cur); cur = [lines[i]]; }
+    else if (cur) cur.push(lines[i]);
+  }
+  if (cur) blocks.push(cur);
+  if (blocks.length < 2) return src;
+  // seeded Fisher-Yates
+  let s = (((opts.seed !== undefined ? opts.seed : (opts.salt || 0)) >>> 0) ^ 0x51ed270b) >>> 0;
+  const rng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
+  for (let i = blocks.length - 1; i > 0; i--) { const j = rng() % (i + 1); const t = blocks[i]; blocks[i] = blocks[j]; blocks[j] = t; }
+  const shuffled = [];
+  for (const b of blocks) for (const l of b) shuffled.push(l);
+  const out = lines.slice(0, firstCase).concat(shuffled, lines.slice(defaultIdx));
+  return out.join('\n');
 }
 
 // Lightweight, safe minification: strip full-line comments, blank lines and
