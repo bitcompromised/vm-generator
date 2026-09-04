@@ -54,11 +54,14 @@ Options:
   --prot-level   <0-3>                   Cipher rounds per function (default 1)
   --encstr       <mode>                  Encrypt string literals: none | str_arr |
                                          hex | bytecode | random
+  --enc-num                              Encrypt integer literals (XOR reconstruction)
   --conceal, --no-conceal                Store integers as unsolved XOR expressions
   --fuse, --no-fuse                      Superinstruction (opcode) fusion
   --permute, --no-permute                Randomize the opcode table
   --mutate-handlers                      Shuffle the dispatch handlers per build
   --loader-form  <form>                  VM loader shape: auto | compact | verbose | split
+  --arch         <name>                  VM architecture (JS target): stack-switch |
+                                         register | register-threaded | register-encrypted
   --prod, --production                   Terse runtime errors (dev builds are verbose)
   --max-objects  <number>                Cap live object/array allocations (0 = off)
   --max-string   <number>                Cap single-string length (0 = off)
@@ -106,6 +109,8 @@ function parseArgs(argv) {
     else if (a === '--prot-level' || a === '--protlevel') opts.protLevel = parseInt(argv[++i], 10);
     else if (a === '--encstr') opts.encStr = String(argv[++i] || '').toLowerCase();
     else if (a === '--no-encstr') opts.encStr = 'none';
+    else if (a === '--enc-num' || a === '--encnum') opts.encNum = true;
+    else if (a === '--no-enc-num') opts.encNum = false;
     else if (a === '--conceal') opts.conceal = true;
     else if (a === '--no-conceal') opts.conceal = false;
     else if (a === '--fuse') opts.fuse = true;
@@ -303,7 +308,7 @@ async function main() {
       renameSymbols: opts.renameSymbols, randomize: opts.randomize,
       // granular protection knobs (undefined => inherit from profile)
       flatten: opts.flatten, bogus: opts.bogus, split: opts.split, protLevel: opts.protLevel,
-      encStr: opts.encStr, conceal: opts.conceal, fuse: opts.fuse, permute: opts.permute,
+      encStr: opts.encStr, encNum: opts.encNum, conceal: opts.conceal, fuse: opts.fuse, permute: opts.permute,
       maxObjects: opts.maxObjects, maxString: opts.maxString, prod: opts.prod,
       mutateHandlers: opts.mutateHandlers, loaderForm: opts.loaderForm,
     });
@@ -327,6 +332,7 @@ async function main() {
     line('  config:');
     line(`    target       ${target}`);
     line(`    profile      ${meta.profile}`);
+    line(`    architecture ${meta.arch}`);
     line(`    format       ${meta.major}.${meta.minor}   protection v${(meta.domains ? 2 : 2)}`);
     line(`    optimize     ${opts.optimize !== false}`);
     line(`    permute      ${(meta.flags & V.FLAG_IDENTPERM) ? 'identity (dev)' : 'randomized'}`);
@@ -345,16 +351,19 @@ async function main() {
     // per-function modifications / virtualization
     const withMods = (meta.modifications || []).filter((m) => m.level !== 'weak' || m.mods.length || m.async);
     if (withMods.length) {
-      line('  functions (level / modifications):');
+      line('  functions (identity / level / modifications):');
       for (const m of withMods) {
         const tags = m.mods.length ? '  [' + m.mods.join(', ') + ']' : '';
-        line(`    ${m.name.padEnd(18)} ${m.level}${m.async ? ' async' : ''}${tags}`);
+        line(`    ${m.name.padEnd(18)} <${(m.identity || 'client').padEnd(8)}> ${m.level}${m.async ? ' async' : ''}${tags}`);
       }
     }
     line('  statistics:');
     const lv = { native: 0, weak: 0, medium: 0, heavy: 0 };
     for (const m of (meta.modifications || [])) lv[m.level] = (lv[m.level] || 0) + 1;
+    const idc = { vm: 0, nativejs: 0, client: 0 };
+    for (const m of (meta.modifications || [])) idc[m.identity] = (idc[m.identity] || 0) + 1;
     line(`    functions    ${meta.numFns} real${meta.dudFns ? ' + ' + meta.dudFns + ' decoy' : ''}`);
+    line(`    identity     vm:${idc.vm || 0} nativejs:${idc.nativejs || 0} client:${idc.client || 0} deadcode:${meta.dudFns || 0}`);
     line(`    protection   native:${lv.native || 0} weak:${lv.weak || 0} medium:${lv.medium || 0} heavy:${lv.heavy || 0}`);
     line(`    image        ${meta.imageSize} bytes`);
     line(`    checksum     0x${meta.checksum.toString(16)}  (+ ${meta.domains ? 4 : 1} integrity domains)`);

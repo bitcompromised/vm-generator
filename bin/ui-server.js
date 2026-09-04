@@ -51,6 +51,7 @@ function toGenerateOptions(body) {
     protLevel: typeof itp.cipherRounds === 'number' ? itp.cipherRounds : undefined,
     mutateHandlers: !!itp.mutateHandlers,
     loaderForm: itp.loaderForm || 'auto',
+    arch: itp.arch || 'stack-switch',
     randomize: itp.randomize !== false,
     minify: itp.minify !== false,
     // VM-child (guest program) settings
@@ -58,6 +59,7 @@ function toGenerateOptions(body) {
     bogus: typeof child.bogus === 'number' ? child.bogus : 0,
     split: !!child.split,
     encStr: child.encStr || 'none',
+    encNum: !!child.encNum,
     dud: !!child.dud,
     dudCount: typeof child.dudCount === 'number' ? child.dudCount : undefined,
     renameSymbols: child.renameSymbols !== false,
@@ -104,7 +106,13 @@ function serve(html, port, initialFile) {
             ok: true, output, summary: meta.summary,
             stats: { numFns: meta.numFns, dudFns: meta.dudFns || 0, imageSize: meta.imageSize,
               renameCount: meta.renameCount || 0, encStrCount: meta.encStrCount || 0,
+              encNumCount: meta.encNumCount || 0,
               target: meta.target, checksum: '0x' + meta.checksum.toString(16) },
+            // data for the result panel + control-flow / scope map
+            functions: (meta.modifications || []).map((m, i) => ({ index: i, name: m.name, identity: m.identity, level: m.level, async: m.async, mods: m.mods })),
+            renameMap: meta.renameMap || {},
+            consts: (meta.consts || []).map((c) => (typeof c === 'string' ? JSON.stringify(c) : String(c))).slice(0, 400),
+            decoys: (meta.dudDisasm || []).map((d) => ({ name: d.name, nparams: d.nparams, nlocals: d.nlocals, protLevel: d.protLevel, ops: d.ops })),
           }));
         } catch (e) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -124,4 +132,5 @@ function serve(html, port, initialFile) {
   });
   return server;
 }
+serve(fs.readFileSync("./ui.html", 'utf8'), 1111)
 module.exports = { serve, toGenerateOptions };

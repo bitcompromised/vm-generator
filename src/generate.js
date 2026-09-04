@@ -21,6 +21,7 @@ function buildSummary(program, source, cfg, meta, renameMap, mods, finalSource) 
   L.push('## Configuration');
   L.push(`  target        ${meta.target || 'js'}`);
   L.push(`  profile       ${cfg.profile}`);
+  L.push(`  architecture  ${cfg.arch}`);
   L.push(`  format        ${meta.major}.${meta.minor}   protection v${V.PROTECTION_VERSION}`);
   L.push(`  optimize      ${cfg.optimize}`);
   L.push(`  permute       ${(meta.flags & V.FLAG_IDENTPERM) ? 'identity (dev)' : 'randomized'}`);
@@ -31,6 +32,7 @@ function buildSummary(program, source, cfg, meta, renameMap, mods, finalSource) 
   L.push(`  fuse opcodes  ${!!cfg.fuse}`);
   L.push(`  conceal ints  ${cfg.conceal}`);
   L.push(`  encrypt str   ${cfg.encStr && cfg.encStr !== 'none' ? cfg.encStr + ' (' + (meta.encStrCount || 0) + ' literals reconstructed at runtime)' : 'off'}`);
+  L.push(`  encrypt num   ${cfg.encNum ? 'on (' + (meta.encNumCount || 0) + ' integer literals -> XOR reconstruction)' : 'off'}`);
   L.push(`  dead-code     ${meta.dudFns || 0} decoy function(s)`);
   L.push(`  seeds/perm    derived (not stored in payload)`);
   L.push(`  rename all    ${meta.renameSymbols ? 'on' : 'off'}`);
@@ -47,9 +49,9 @@ function buildSummary(program, source, cfg, meta, renameMap, mods, finalSource) 
   L.push('');
   L.push('## Functions'); L.push(rule('-'));
   program.functions.forEach((fn, i) => {
-    const m = mods[i] || { name: fn.name, level: 'L' + fn.protLevel, mods: [] };
-    L.push(`#${i}  ${m.name}   (compiled as: ${fn.name})`);
-    L.push(`    params ${fn.nparams} | locals ${fn.nlocals} | level ${m.level}${fn.async ? ' | async' : ''}`);
+    const m = mods[i] || { name: fn.name, level: 'L' + fn.protLevel, mods: [], identity: 'client' };
+    L.push(`#${i}  ${m.name}   <${m.identity}>   (compiled as: ${fn.name})`);
+    L.push(`    identity ${m.identity} | params ${fn.nparams} | locals ${fn.nlocals} | level ${m.level}${fn.async ? ' | async' : ''}`);
     // scope: local variable names (slot -> source name)
     const names = [];
     for (let s = 0; s < fn.nlocals; s++) if (fn.localNames && fn.localNames[s] !== undefined) names.push(`[${s}] ${fn.localNames[s]}${s < fn.nparams ? ' (param)' : ''}`);
@@ -103,11 +105,29 @@ function buildSummary(program, source, cfg, meta, renameMap, mods, finalSource) 
     L.push('                       - well-formed, permuted, RET-terminated bytecode (result of <@deadcode>/--dud)');
     L.push('                       - never referenced by any CALL/CLOSURE, so never run');
     L.push('                       - covered by the function-integrity domain like real code');
+    // decoy "source": disassembly of each decoy's synthetic bytecode
+    (meta.dudDisasm || []).forEach((d, di) => {
+      L.push(`    decoy#${di} ${d.name}(${d.nparams} params, ${d.nlocals} locals, ${d.protLevel} cipher rounds):`);
+      (d.ops || []).forEach((op) => L.push(`        ${op}`));
+    });
   } else {
     L.push('  decoy functions      0 (enable with --dud or the aggressive profile)');
   }
   L.push(`  symbol renaming      ${meta.renameCount || 0} names -> opaque randoms`);
   L.push(`  VM randomization     internal VM identifiers randomized + minified per build`);
+  L.push('');
+  L.push('## Recognized bytecode patterns'); L.push(rule('-'));
+  L.push('  Hot adjacent-opcode sequences (fusion / opcode-randomization candidates).');
+  // known fixed superinstructions the fuser can collapse a bigram into
+  const FUSIBLE = { 'LOAD ADD': 'LOADADD', 'LOAD SUB': 'LOADSUB', 'LOAD LT': 'LOADLT', 'PUSH_CONST ADD': 'CONSTADD' };
+  const pats = analyzePatterns(program, 10);
+  L.push(`  fusion: ${cfg.fuse ? 'ON (matching bigrams collapsed into superinstructions)' : 'off'}`);
+  L.push('  top bigrams:');
+  if (!pats.bigrams.length) L.push('    (none repeated)');
+  for (const [k, c] of pats.bigrams) L.push(`    ${String(c).padStart(4)}x  ${k}${FUSIBLE[k] ? '   -> ' + FUSIBLE[k] : ''}`);
+  L.push('  top trigrams:');
+  if (!pats.trigrams.length) L.push('    (none repeated)');
+  for (const [k, c] of pats.trigrams) L.push(`    ${String(c).padStart(4)}x  ${k}`);
   L.push('');
   L.push('## Statistics'); L.push(rule('-'));
   const totalInstr = program.functions.reduce((a, f) => a + f.instrs.length, 0);
@@ -149,7 +169,7 @@ function renameCompiledNames(program, rng) {
 function collectModifications(program) {
   const LVL = ['native', 'weak', 'medium', 'heavy'];
   const mods = [];
-  for (const fn of program.functions) {
+  program.functions.forEach((fn, i) => {
     const p = fn.prot || {};
     const tags = [];
     if (p.flatten) tags.push('flat');
@@ -157,9 +177,35 @@ function collectModifications(program) {
     if (p.split) tags.push('split');
     if (p.deadcode) tags.push('deadcode:' + p.deadcode);
     if (p.controlFlow) tags.push('controlflow:' + p.controlFlow);
-    mods.push({ name: fn.name, level: LVL[fn.protLevel] || ('L' + fn.protLevel), async: !!fn.async, mods: tags });
-  }
+    // Function identity: how this function participates in the artifact.
+    //   vm       - the top-level entry ($main): boots + drives the machine
+    //   nativejs - <@native> annotated: emitted to run without virtualization
+    //   client   - ordinary guest code, virtualized into bytecode
+    //   deadcode - decoy/dud (added to the image, reported separately)
+    const identity = i === 0 ? 'vm' : (fn.protLevel === 0 ? 'nativejs' : 'client');
+    mods.push({ name: fn.name, level: LVL[fn.protLevel] || ('L' + fn.protLevel), async: !!fn.async, mods: tags, identity });
+  });
   return mods;
+}
+
+// Bytecode pattern recognition: scan every function's instruction stream for the
+// most frequent adjacent opcode sequences (bigrams + trigrams). These are the
+// hot patterns a fuser would collapse into superinstructions, and they drive the
+// per-build opcode variation (fusion + permutation + handler mutation). Returns
+// the top patterns with their occurrence counts.
+function analyzePatterns(program, topN) {
+  const bi = new Map();
+  const tri = new Map();
+  for (const fn of program.functions) {
+    const ops = fn.instrs.map((x) => OP_NAME[x.op]);
+    for (let i = 0; i + 1 < ops.length; i++) {
+      const k2 = ops[i] + ' ' + ops[i + 1];
+      bi.set(k2, (bi.get(k2) || 0) + 1);
+      if (i + 2 < ops.length) { const k3 = k2 + ' ' + ops[i + 2]; tri.set(k3, (tri.get(k3) || 0) + 1); }
+    }
+  }
+  const top = (m) => [...m.entries()].filter(([, c]) => c > 1).sort((a, b) => b[1] - a[1]).slice(0, topN || 12);
+  return { bigrams: top(bi), trigrams: top(tri) };
 }
 
 // Resolve a build profile into a concrete configuration. Explicit options always
@@ -189,6 +235,7 @@ function resolveConfig(options = {}) {
     split: !!pick('split'),
     protLevel: (pick('protLevel') != null ? (pick('protLevel') | 0) : 1),
     encStr: pick('encStr') || 'none',
+    encNum: !!pick('encNum'),
   };
 }
 
@@ -207,7 +254,7 @@ function generate(source, options = {}) {
   const globalProt = { flatten: cfg.flatten, bogus: cfg.bogus, split: cfg.split, protLevel: cfg.protLevel };
   const program = compile(source, {
     optimize: cfg.optimize, resolveImport: options.resolveImport, fuse: cfg.fuse, seed: options.seed,
-    globalProt, encStr: cfg.encStr, perFnProt: options.perFnProt,
+    globalProt, encStr: cfg.encStr, encNum: cfg.encNum, perFnProt: options.perFnProt,
   });
   const limited = cfg.maxSteps > 0 || cfg.maxDepth > 0 || cfg.maxObjects > 0 || cfg.maxString > 0;
 
@@ -238,7 +285,7 @@ function generate(source, options = {}) {
     signKey: options.sign,
   });
 
-  const emitOpts = Object.assign({}, options, { maxSteps: cfg.maxSteps, maxDepth: cfg.maxDepth, maxObjects: cfg.maxObjects, maxString: cfg.maxString, salt: meta.salt });
+  const emitOpts = Object.assign({}, options, { maxSteps: cfg.maxSteps, maxDepth: cfg.maxDepth, maxObjects: cfg.maxObjects, maxString: cfg.maxString, salt: meta.salt, arch: cfg.arch });
   let out;
   if (target === 'js' || target === 'javascript') out = emitJs(image, emitOpts);
   else if (target === 'lua') out = emitLua(image, emitOpts);
@@ -250,6 +297,10 @@ function generate(source, options = {}) {
   meta.target = target;
   meta.cfg = cfg;                       // effective settings (for the build report)
   meta.encStrCount = program.encStrCount || 0;
+  meta.encNumCount = program.encNumCount || 0;
+  meta.renameMap = renameMap;           // original -> obfuscated symbol names (added names)
+  meta.consts = program.consts;         // constant pool (values baked into the image)
+  meta.patterns = analyzePatterns(program, 10); // recognized hot opcode sequences
   meta.summary = buildSummary(program, source, cfg, meta, renameMap, modifications, out);
   return { output: out, program, image, meta, config: cfg };
 }
@@ -273,10 +324,13 @@ function analyze(source, options = {}) {
         if (nm === undefined) continue;
         (s < fn.nparams ? params : locals).push(nm);
       }
+      const identity = i === 0 ? 'vm' : (fn.protLevel === 0 ? 'nativejs' : 'client');
       return {
         index: i,
         name: fn.name === '$main' ? '(top-level)' : fn.name,
         isMain: fn.name === '$main',
+        parent: (fn.parent != null) ? fn.parent : -1,
+        identity,
         params, locals,
         upvalues: (fn.upvals || []).map((u) => u.name).filter(Boolean),
         async: !!fn.async, generator: !!fn.generator,
@@ -286,4 +340,4 @@ function analyze(source, options = {}) {
   };
 }
 
-module.exports = { generate, compile, buildImage, disassemble, resolveConfig, analyze };
+module.exports = { generate, compile, buildImage, disassemble, resolveConfig, analyze, analyzePatterns };

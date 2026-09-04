@@ -35,18 +35,33 @@ function encStrExpr(str, mode, rng) {
   const codes = Array.from(str).map((ch) => ({ type: 'Num', value: ch.charCodeAt(0) }));
   return { type: 'Call', callee: { type: 'Member', object: { type: 'Ident', name: 'String' }, property: 'fromCharCode' }, args: codes };
 }
-function encryptStrings(ast, mode, seed) {
-  if (!mode || mode === 'none') return ast;
+// Reconstruct an integer literal at runtime as (A ^ B) so it never appears as a
+// plaintext constant. Only u32 integers are eligible; others are left as-is.
+function encNumExpr(value, rng) {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff || Object.is(value, -0)) return null;
+  const A = rng() >>> 0;
+  const B = (value ^ A) >>> 0;
+  return { type: 'Binary', op: '^', left: { type: 'Num', value: A, _enc: true }, right: { type: 'Num', value: B, _enc: true } };
+}
+// Global literal obfuscation. `mode` (none|str_arr|hex|bytecode|random) encrypts
+// string literals; `encNum` additionally rewrites integer literals into XOR
+// reconstructions ("obfuscate table values"). Semantics are preserved.
+function encryptStrings(ast, mode, seed, encNum) {
+  const doStr = mode && mode !== 'none';
+  if (!doStr && !encNum) return ast;
   let s = ((seed !== undefined ? seed : 0x9e3779b9) ^ 0x5bd1e995) >>> 0;
   const rng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
-  let count = 0;
+  let count = 0, numCount = 0;
   const walk = (node) => {
     if (!node || typeof node !== 'object') return node;
     if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) node[i] = walk(node[i]); return node; }
-    // Replace a bare string literal (that we did not already synthesize) in place.
-    if (node.type === 'Str' && !node._enc && typeof node.value === 'string' && node.value.length > 0) {
+    if (doStr && node.type === 'Str' && !node._enc && typeof node.value === 'string' && node.value.length > 0) {
       count++;
       return encStrExpr(node.value, mode, rng);
+    }
+    if (encNum && node.type === 'Num' && !node._enc && typeof node.value === 'number') {
+      const rep = encNumExpr(node.value, rng);
+      if (rep) { numCount++; return rep; }
     }
     for (const k of Object.keys(node)) {
       if (k === 'type') continue;
@@ -57,6 +72,7 @@ function encryptStrings(ast, mode, seed) {
   };
   walk(ast);
   ast._encStrCount = count;
+  ast._encNumCount = numCount;
   return ast;
 }
 
@@ -229,6 +245,7 @@ class Compiler {
     const main = new FnEmitter('$main', [], this, null);
     main.isMain = true; // top-level `let` binds into the global environment
     main.globalIndex = 0;
+    main.parentIndex = -1; // root of the function tree
     for (const s of topStmts) this.compileStmt(main, s);
     main.emit(OP.HALT);
     this.functions[0] = this.finishFn(main);
@@ -237,6 +254,7 @@ class Compiler {
     for (const { idx, stmt } of topFns) {
       const fe = new FnEmitter(stmt.name, stmt.params, this, null);
       fe.globalIndex = idx;
+      fe.parentIndex = 0; // top-level functions hang off the root ($main)
       fe.protLevel = stmt.protLevel; // selective-virtualization annotation (may be undefined)
       fe.prot = stmt.prot;           // per-pass modification knobs (flat/bogus/split/...)
       fe.restParam = stmt.restParam;
@@ -263,6 +281,7 @@ class Compiler {
     this.functions.push(null); // reserve the slot before compiling the body
     const fe = new FnEmitter(node.name || '$anon', node.params, this, parentFe);
     fe.globalIndex = idx;
+    fe.parentIndex = (parentFe && parentFe.globalIndex != null) ? parentFe.globalIndex : 0;
     fe.protLevel = node.protLevel; // selective-virtualization annotation (may be undefined)
     fe.prot = node.prot;           // per-pass modification knobs (flat/bogus/split/...)
     fe.restParam = node.restParam;
@@ -368,6 +387,7 @@ class Compiler {
       async: !!fe.async,
       // build-report metadata (names + how much the obfuscation passes grew the code)
       localNames: fe.localNames,
+      parent: (fe.parentIndex != null) ? fe.parentIndex : -1, // parent fn index (for scope/CFG map)
       origInstrCount,
       finalInstrCount: instrs.length,
       preTransformOps: fe.preTransformOps, // canonical ops before CF passes (for summary)
@@ -895,7 +915,7 @@ class Compiler {
       case '===': return OP.EQ; case '!==': return OP.NEQ; case '==': return OP.EQ; case '!=': return OP.NEQ;
       case '<': return OP.LT; case '>': return OP.GT; case '<=': return OP.LTE; case '>=': return OP.GTE;
       case '&': return OP.BAND; case '|': return OP.BOR; case '^': return OP.BXOR;
-      case '<<': return OP.SHL; case '>>': return OP.SHR;
+      case '<<': return OP.SHL; case '>>': return OP.SHR; case '>>>': return OP.SHR;
       default: throw new Error(`Unknown binary operator ${op}`);
     }
   }
@@ -908,10 +928,11 @@ function compile(src, opts = {}) {
   if (opts.optimize) ast = optimize(ast); // behavior-preserving AST optimization
   // Global string encryption runs AFTER optimization (so constant folding can't
   // re-collapse the reconstructed literals) but before codegen.
-  if (opts.encStr && opts.encStr !== 'none') ast = encryptStrings(ast, opts.encStr, opts.seed);
+  if ((opts.encStr && opts.encStr !== 'none') || opts.encNum) ast = encryptStrings(ast, opts.encStr, opts.seed, opts.encNum);
   const c = new Compiler({ fuse: opts.fuse, useEnvObjects: !!opts.useEnvObjects, seed: opts.seed, globalProt: opts.globalProt, perFnProt: opts.perFnProt });
   const program = c.compileProgram(ast);
   program.encStrCount = ast._encStrCount || 0;
+  program.encNumCount = ast._encNumCount || 0;
   program.upvalueMode = c.useEnvObjects ? 'env' : 'cells';
   return program;
 }

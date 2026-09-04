@@ -25,6 +25,7 @@ const KW_ALIAS = { function: 'fn', const: 'let', var: 'let' };
 // the first op that matches at the cursor, so 3-char must precede 2-char, etc).
 const OPS = [
   '...',
+  '>>>=', '>>>',
   '<<=', '>>=', '===', '!==', '**=',
   '==', '!=', '<=', '>=', '&&', '||', '<<', '>>', '++', '--', '**', '?.', '??',
   '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '=>',
@@ -37,6 +38,12 @@ function isIdentPart(c) { return /[A-Za-z0-9_$]/.test(c); }
 function isDigit(c) { return c >= '0' && c <= '9'; }
 
 function lex(src) {
+  // Skip a leading shebang line (`#!/usr/bin/env node`), which is legal at the
+  // very start of an executable .js file but is not a token.
+  if (src.charCodeAt(0) === 0x23 /* # */ && src.charCodeAt(1) === 0x21 /* ! */) {
+    const nl = src.indexOf('\n');
+    src = nl === -1 ? '' : src.slice(nl); // keep the newline so line numbers stay aligned
+  }
   const toks = [];
   let i = 0, line = 1, col = 1;
   const N = src.length;
@@ -69,13 +76,32 @@ function lex(src) {
     // operator; `<@` is unambiguous (no expression starts with `@`).
     if (c === '<' && src[i + 1] === '@') {
       adv(2);
-      let body = '';
-      while (i < N && src[i] !== '>') { body += src[i]; adv(); }
+      // Capture the directive body up to the matching '>' at bracket-depth 0, so
+      // a body may contain code with '>' comparisons, call args and even a full
+      // `{ ... }` function body (e.g. <@fn f(x){ return x>0 }>). String literals
+      // are skipped so quoted '>' / brackets do not affect the depth.
+      let body = '', depth = 0, dirDepth = 0, q = null;
+      while (i < N) {
+        const ch = src[i];
+        if (q) { body += ch; if (ch === q && src[i - 1] !== '\\') q = null; adv(); continue; }
+        if (ch === '"' || ch === "'" || ch === '`') { q = ch; body += ch; adv(); continue; }
+        if (ch === '<' && src[i + 1] === '@') { dirDepth++; body += '<@'; adv(2); continue; } // nested <@...>
+        if (ch === '(' || ch === '[' || ch === '{') depth++;
+        else if (ch === ')' || ch === ']' || ch === '}') depth--;
+        else if (ch === '>' && depth <= 0) {
+          if (dirDepth > 0) { dirDepth--; body += '>'; adv(); continue; } // close a nested directive
+          break; // outer directive terminator
+        }
+        body += ch; adv();
+      }
       if (src[i] === '>') adv();
       const parts = body.trim().match(/"[^"]*"|'[^']*'|\S+/g) || [];
       const name = (parts[0] || '').toLowerCase();
       const args = parts.slice(1).map((a) => (/^["']/.test(a) ? a.slice(1, -1) : a));
-      push('directive', { name, args });
+      // `rest` is the raw body text after the directive name -- used by code
+      // directives (<@fn>, <@call>, <@log>, ...) that re-parse it as source.
+      const rest = body.trim().replace(/^\S+\s*/, '');
+      push('directive', { name, args, body: body.trim(), rest });
       continue;
     }
 

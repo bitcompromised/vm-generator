@@ -176,6 +176,21 @@ function makeDudBytes(perm, numCanon, nconsts, nlocals, rng) {
 // Build `count` decoy function images to append after the real function table.
 // `startIdx` is the flat index the first decoy will occupy so its cipher key
 // (which is keyed by function index) matches what the VM derives on decode.
+// Disassemble a decoy's PLAIN (pre-cipher) permuted byte stream back into a
+// readable canonical-opcode listing, for the build summary / UI "decoy source".
+function disasmDud(plain, perm) {
+  const inv = []; for (let c = 0; c < perm.length; c++) inv[perm[c]] = c;
+  const out = []; let i = 0;
+  while (i < plain.length) {
+    const canon = inv[plain[i++]];
+    if (canon === undefined) { out.push('??'); continue; }
+    const kinds = OP_OPERANDS[canon] || [];
+    const args = [];
+    for (const kind of kinds) { if (kind === 'u16') { args.push(plain[i] | (plain[i + 1] << 8)); i += 2; } else { args.push(plain[i++]); } }
+    out.push(OP_NAME[canon] + (args.length ? ' ' + args.join(', ') : ''));
+  }
+  return out;
+}
 function makeDudFunctions(count, startIdx, perm, numCanon, codeSeed, nconsts, rng) {
   const duds = [];
   for (let k = 0; k < count; k++) {
@@ -186,7 +201,7 @@ function makeDudFunctions(count, startIdx, perm, numCanon, codeSeed, nconsts, rn
     const plain = makeDudBytes(perm, numCanon, nconsts, nlocals, rng);
     const enc = encRounds(plain, codeSeed, idx, level);
     const name = DUD_NAMES[rng() % DUD_NAMES.length];
-    duds.push({ name, nparams, nlocals, upvals: [], protLevel: level, enc });
+    duds.push({ name, nparams, nlocals, upvals: [], protLevel: level, enc, disasm: disasmDud(plain, perm) });
   }
   return duds;
 }
@@ -242,10 +257,15 @@ function buildImage(program, options = {}) {
   // real function. All draws happen here, after real content, so enabling duds
   // never perturbs the bytes of the real program for a given seed.
   const realFnCount = fnImages.length;
+  let dudDisasm = [];
   if (options.dud) {
-    const count = (options.dudCount != null) ? options.dudCount : (2 + (rng() % 3));
+    // Default: scale decoys with program size so the real functions are diluted
+    // among plausible neighbours (capped so the image does not balloon).
+    const scaled = Math.min(16, 3 + Math.floor(realFnCount / 3)) + (rng() % 3);
+    const count = (options.dudCount != null) ? options.dudCount : scaled;
     const duds = makeDudFunctions(count, realFnCount, perm, numCanon, codeSeed, program.consts.length, rng);
     for (const d of duds) fnImages.push(d);
+    dudDisasm = duds.map((d) => ({ name: d.name, nparams: d.nparams, nlocals: d.nlocals, protLevel: d.protLevel, ops: d.disasm || [] }));
   }
 
   // ---- assemble body ----
@@ -326,6 +346,7 @@ function buildImage(program, options = {}) {
       profile: profileName, arch: archName, signed,
       domains: { header: dHeader, dispatch: dDispatch, const: dConst, fn: dFn },
       numFns: fnImages.length, realFns: realFnCount, dudFns: fnImages.length - realFnCount,
+      dudDisasm,
       imageSize: image.length,
     },
   };

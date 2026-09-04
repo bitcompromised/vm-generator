@@ -45,8 +45,8 @@ module.exports = {
 
   // VM architecture (header byte 6). Only the stack/switch VM exists today;
   // the field reserves space so register / threaded / block VMs can coexist.
-  ARCH: { 'stack-switch': 0, 'register-threaded': 1, 'register-indirect': 2, 'stack-block': 3 },
-  ARCH_NAMES: ['stack-switch', 'register-threaded', 'register-indirect', 'stack-block'],
+  ARCH: { 'stack-switch': 0, 'register-threaded': 1, 'register-indirect': 2, 'stack-block': 3, 'register': 4, 'register-encrypted': 5 },
+  ARCH_NAMES: ['stack-switch', 'register-threaded', 'register-indirect', 'stack-block', 'register', 'register-encrypted'],
 };
 
 // Per-profile build configuration. `optimize` and `permute` shape the artifact;
@@ -60,8 +60,8 @@ module.exports = {
 // function (0..3); `encStr` = string-literal reconstruction (none|str_arr|hex|
 // bytecode|random); `fuse` = superinstruction fusion.
 module.exports.PROFILE_CONFIG = {
-  development:  { optimize: false, permute: false, conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 0, encStr: 'none',  maxSteps: 0,         maxDepth: 0,    maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
-  balanced:     { optimize: true,  permute: true,  conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 1, encStr: 'none',  maxSteps: 0,         maxDepth: 1024, maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
-  aggressive:   { optimize: true,  permute: true,  conceal: true,  dud: true,  fuse: true,  flatten: true,  bogus: 2, split: true,  protLevel: 2, encStr: 'random', maxSteps: 200000000, maxDepth: 512,  maxObjects: 5000000, maxString: 33554432, arch: 'stack-switch' },
-  performance:  { optimize: true,  permute: true,  conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 1, encStr: 'none',  maxSteps: 0,         maxDepth: 0,    maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
+  development:  { optimize: false, permute: false, conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 0, encStr: 'none',  encNum: false, maxSteps: 0,         maxDepth: 0,    maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
+  balanced:     { optimize: true,  permute: true,  conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 1, encStr: 'none',  encNum: false, maxSteps: 0,         maxDepth: 1024, maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
+  aggressive:   { optimize: true,  permute: true,  conceal: true,  dud: true,  fuse: true,  flatten: true,  bogus: 2, split: true,  protLevel: 2, encStr: 'random', encNum: true,  maxSteps: 200000000, maxDepth: 512,  maxObjects: 5000000, maxString: 33554432, arch: 'stack-switch' },
+  performance:  { optimize: true,  permute: true,  conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 1, encStr: 'none',  encNum: false, maxSteps: 0,         maxDepth: 0,    maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
 };

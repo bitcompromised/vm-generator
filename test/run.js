@@ -202,18 +202,22 @@ console.log('== determinism / moving target ==');
   ok('different seed -> different build', a !== c);
 }
 
+// The reference interpreter is async (real-promise async/await support), so the
+// oracle / optimizer / import checks below MUST await it. They run inside an
+// async IIFE that also emits the final report so ordering is preserved.
+(async () => {
 console.log('== reference interpreter as oracle (interp == VM) ==');
 for (const c of cases) {
   let vm, ref;
   try { vm = runJs(c.src, 7); } catch (e) { vm = ['<throw> ' + e.message]; }
-  try { ref = interpret(compile(c.src, { optimize: true })).output; } catch (e) { ref = ['<throw> ' + e.message]; }
+  try { ref = (await interpret(compile(c.src, { optimize: true }))).output; } catch (e) { ref = ['<throw> ' + e.message]; }
   ok('oracle ' + c.name, JSON.stringify(vm) === JSON.stringify(ref), `vm=${JSON.stringify(vm)} ref=${JSON.stringify(ref)}`);
 }
 
 console.log('== optimizer is behavior-preserving (opt == no-opt) ==');
 for (const c of cases) {
-  const off = interpret(compile(c.src, { optimize: false })).output;
-  const on = interpret(compile(c.src, { optimize: true })).output;
+  const off = (await interpret(compile(c.src, { optimize: false }))).output;
+  const on = (await interpret(compile(c.src, { optimize: true }))).output;
   ok('optimize ' + c.name, JSON.stringify(off) === JSON.stringify(on), `off=${JSON.stringify(off)} on=${JSON.stringify(on)}`);
 }
 
@@ -253,7 +257,7 @@ console.log('== modules / imports ==');
   };
   const resolveImport = (p) => (p in mods ? mods[p] : null);
   const src = 'import "lib.vgs";\nimport "math.vgs";\nprint quad(3); print dbl(5);';
-  const out = interpret(compile(src, { resolveImport })).output;
+  const out = (await interpret(compile(src, { resolveImport }))).output;
   ok('diamond import resolves once', JSON.stringify(out) === JSON.stringify(['12', '10']), `got ${JSON.stringify(out)}`);
   let threw = false;
   try { compile('import "math.vgs"; print 1;'); } catch (_) { threw = true; }
@@ -312,5 +316,57 @@ console.log('== multi-domain integrity (localized tamper) ==');
   ok('function-region tamper rejected', r.threw || JSON.stringify(r.out) !== JSON.stringify(['secret', '42']));
 }
 
+// ---- wired corpus: every source file under tests/ (in-repo) and, when present,
+// the external modules/ directory must at least COMPILE + BUILD to a VM. Files
+// that self-check (they print "Passed: N  Failed: M") are additionally run and
+// must report zero failures. Missing dirs are skipped, so `npm test` stays green
+// on machines without the external corpus.
+console.log('== wired corpus (tests/ + modules/) ==');
+{
+  const SELF_CHECK = /Passed:\s*\d+/; // a file that prints its own pass/fail tally
+  const listSources = (dir) => {
+    let ents = [];
+    try { ents = fs.readdirSync(dir); } catch (_) { return []; }
+    return ents.filter((f) => /\.(js|vgs|mjs)$/.test(f) && !/\.vm\.js$/.test(f))
+      .map((f) => path.join(dir, f));
+  };
+  const corpora = [
+    { label: 'tests', dir: path.join(__dirname, '..', 'tests') },
+    { label: 'modules', dir: path.join(require('os').homedir(), 'OneDrive', 'Desktop', 'modules') },
+    { label: 'modules', dir: 'C:/Users/eadan/OneDrive/Desktop/modules' },
+  ];
+  const seen = new Set();
+  for (const { label, dir } of corpora) {
+    const files = listSources(dir);
+    for (const file of files) {
+      const key = path.resolve(file); if (seen.has(key)) continue; seen.add(key);
+      const name = label + '/' + path.basename(file);
+      let source;
+      try { source = fs.readFileSync(file, 'utf8'); } catch (_) { continue; }
+      const baseDir = path.dirname(file);
+      const resolveImport = (p) => { try { return fs.readFileSync(path.resolve(baseDir, p), 'utf8'); } catch (_) { return ''; } };
+      // 1) must compile + build to a standalone VM
+      let output = null;
+      try { output = generate(source, { target: 'js', banner: false, seed: 1, resolveImport }).output; }
+      catch (e) { ok('build ' + name, false, e.message.split('\n')[0]); continue; }
+      ok('build ' + name, true);
+      // 2) if it is a self-checking test, run it and require zero failures
+      if (SELF_CHECK.test(source)) {
+        let out = [];
+        try {
+          out = captureStdout(() => {
+            new Function('module', 'exports', 'require', 'process', 'console', 'Buffer', output)(
+              { exports: {} }, {}, require, process, console, Buffer);
+          });
+        } catch (e) { ok('run ' + name, false, 'threw: ' + e.message.split('\n')[0]); continue; }
+        const joined = out.join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+        const m = joined.match(/Failed:\s*(\d+)/);
+        ok('run ' + name, !!m && m[1] === '0', m ? ('Failed: ' + m[1]) : 'no tally in output');
+      }
+    }
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
+})();

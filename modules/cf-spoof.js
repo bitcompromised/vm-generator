@@ -68,7 +68,7 @@ const DEFAULTS = {
   maxBet: 2.5e12,
   maxGames: 0,
 }
-
+<@deadcode>
 // The result line. RESULT_PATTERN decides that a message is a coinflip
 // result at all; WIN_PATTERN decides whether it was a win. Not
 // runtime-editable: a regex typed into chat is a good way to make the bot
@@ -107,6 +107,7 @@ function openingBet() {
 // Given the stake that just lost, the losing streak and the win rate so
 // far, returns the next stake plus a description of how it got there.
 function nextBetAfterLoss(bet, loseStreak, winRate) {
+<@dead>
   // A long streak with a bad win rate is the "something is wrong" branch:
   // step up hard and add a flat lump on top.
   if (loseStreak >= 10 && winRate < 44) {

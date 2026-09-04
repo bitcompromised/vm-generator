@@ -11,7 +11,7 @@ const BINPREC = {
   '|': 3, '^': 4, '&': 5,
   '===': 6, '!==': 6, '==': 6, '!=': 6,
   '<': 7, '>': 7, '<=': 7, '>=': 7, 'instanceof': 7, 'in': 7,
-  '<<': 8, '>>': 8,
+  '<<': 8, '>>': 8, '>>>': 8,
   '+': 9, '-': 9,
   '*': 10, '/': 10, '%': 10,
   '**': 11,
@@ -21,7 +21,17 @@ const BINPREC = {
 // operator text, not 'op').
 const KEYWORD_BINOPS = new Set(['instanceof', 'in']);
 
-function parse(src) {
+// Directives that expand to code (as opposed to protection annotations).
+const CODE_DIRECTIVES = new Set(['fn', 'function', 'call', 'dudret', 'if', 'exists', 'throw', 'quit', 'log', 'warn']);
+
+// Temp-name counter is module-level so a recursive fragment parse (used to expand
+// code directives) continues the outer numbering instead of colliding at __d0.
+// A top-level parse resets it, keeping builds reproducible.
+let TMP = 0;
+
+function parse(src, parseOpts) {
+  parseOpts = parseOpts || {};
+  if (!parseOpts.fragment) TMP = 0;
   const toks = lex(src);
   let p = 0;
 
@@ -80,7 +90,14 @@ function parse(src) {
     while (toks[j] && toks[j].type === 'directive') j++; // skip <@...> before the name
     const n1 = toks[j];
     if (!n1) return false;
-    if (n1.type === 'op' && n1.value === '*') return true;          // fn* generator
+    if (n1.type === 'op' && n1.value === '*') {                     // fn* generator ...
+      // ... but only if a name or '(' follows the '*'. `fn * 2` is `fn` (an
+      // identifier) multiplied, not a generator function.
+      const n2 = toks[j + 1];
+      if (!n2) return false;
+      if (n2.type === 'op') return n2.value === '(';
+      return n2.type !== 'str' && n2.type !== 'num' && typeof n2.value === 'string' && /^[A-Za-z_$]/.test(n2.value);
+    }
     if (n1.type !== 'op' && n1.type !== 'str' && n1.type !== 'num'
         && typeof n1.value === 'string' && /^[A-Za-z_$]/.test(n1.value)) return true; // named
     if (n1.type === 'op' && n1.value === '(') {                     // anonymous: fn (..) {
@@ -222,6 +239,16 @@ function parse(src) {
     return { type: 'Call', callee: { type: 'Member', object: { type: 'Ident', name: 'String' }, property: 'fromCharCode' }, args: codes };
   }
 
+  // <@encstr ...>NUMBER -> reconstruct an integer literal at runtime as (A ^ B)
+  // so the plaintext value never appears in the constant pool. Falls back to the
+  // literal for non-u32 values (XOR only reconstructs unsigned 32-bit integers).
+  function encNumNode(value) {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff || Object.is(value, -0)) return { type: 'Num', value };
+    const A = (Math.random() * 0x100000000) >>> 0;
+    const B = (value ^ A) >>> 0;
+    return { type: 'Binary', op: '^', left: { type: 'Num', value: A }, right: { type: 'Num', value: B } };
+  }
+
   // <@random max min> -> a runtime expression yielding a random integer in
   // [min, max] (inclusive). Args are optional; defaults to [0, 1].
   function randomNode(a, b) {
@@ -247,6 +274,14 @@ function parse(src) {
   }
 
   function parseStatement() {
+    // A standalone code directive (<@fn>, <@call>, <@throw>, <@quit>, <@log>, ...)
+    // IS the statement -- expand it directly rather than attaching to a follower.
+    if (at('directive') && CODE_DIRECTIVES.has(peek().value.name)) {
+      const d = next().value;
+      const node = expandDirectiveStmt(d);
+      if (atOp(';')) eatOp(';');
+      if (node) return node;
+    }
     if (at('annot') || at('directive')) {
       const annots = [];
       const directives = [];
@@ -295,7 +330,7 @@ function parse(src) {
   // Compound-assignment operators lower to `target = target <op> rhs`.
   const ASSIGN_OPS = {
     '=': null, '+=': '+', '-=': '-', '*=': '*', '/=': '/', '%=': '%',
-    '&=': '&', '|=': '|', '^=': '^', '<<=': '<<', '>>=': '>>',
+    '&=': '&', '|=': '|', '^=': '^', '<<=': '<<', '>>=': '>>', '>>>=': '>>>',
   };
 
   // Parse one "simple statement" (assignment, compound assignment,
@@ -335,8 +370,70 @@ function parse(src) {
   }
 
   // ---- destructuring & parameters ----
-  let tmpCounter = 0;
-  const freshTmp = () => `__d${tmpCounter++}`;
+  const freshTmp = () => `__d${TMP++}`;
+
+  // Expand a code directive into an AST node by synthesizing equivalent source
+  // and re-parsing it as a fragment (nested directives inside are handled too).
+  const fragStmts = (s) => parse(s, { fragment: true }).body;
+  const fragExpr = (s) => {
+    const prog = parse('let __vmgen_frag = (' + s + ');', { fragment: true });
+    const ln = prog.body.find((n) => n.type === 'Let' && n.name === '__vmgen_frag');
+    return ln ? ln.value : { type: 'Null' };
+  };
+  // Split a directive body into comma-separated call args, preserving quoted
+  // strings (each whitespace/quote-delimited part becomes one argument).
+  // Split a directive body into arguments, treating a quoted string or a nested
+  // `<@...>` directive (with its own nesting) as a single argument, and splitting
+  // the rest on whitespace. Keeps quotes so string literals survive.
+  const rawParts = (rest) => {
+    const out = []; let i = 0; const N = rest.length;
+    while (i < N) {
+      while (i < N && /\s/.test(rest[i])) i++;
+      if (i >= N) break;
+      let part = '';
+      const c = rest[i];
+      if (c === '"' || c === "'" || c === '`') { const qq = c; part += rest[i++]; while (i < N && rest[i] !== qq) part += rest[i++]; if (i < N) part += rest[i++]; }
+      else if (c === '<' && rest[i + 1] === '@') { let d = 0; while (i < N) { if (rest[i] === '<' && rest[i + 1] === '@') { part += '<@'; i += 2; d++; continue; } if (rest[i] === '>') { part += '>'; i++; d--; if (d === 0) break; continue; } part += rest[i++]; } }
+      else { while (i < N && !/\s/.test(rest[i])) part += rest[i++]; }
+      out.push(part);
+    }
+    return out;
+  };
+  const logArgs = (rest) => rawParts(rest).join(', ');
+  // <@if a b> / <@exists v> read positional args from the raw body so quoted
+  // strings survive (the token's `args` are quote-stripped, which would turn
+  // "big" into the identifier big).
+  const ifExpr = (rest) => { const P = rawParts(rest); return '((' + (P[0] || 'null') + ') ? (' + (P.slice(1).join(' ') || 'null') + ') : null)'; };
+  const existsExpr = (rest) => '(typeof ' + (rawParts(rest)[0] || 'undefined') + ' !== "undefined")';
+  // Statement-position expansion. Returns an AST statement, or null if `d` is not
+  // a code directive.
+  function expandDirectiveStmt(d) {
+    const stmt = (expr) => ({ type: 'ExprStmt', expr }); // an expression used as a statement
+    switch (d.name) {
+      case 'fn': case 'function': return fragStmts('function ' + d.rest)[0];        // <@fn name(args){body}>
+      case 'call': return stmt(fragExpr(d.rest));                                    // <@call f(args)>
+      case 'log': return stmt(fragExpr('console.log(' + logArgs(d.rest) + ')'));      // <@log ...msg>
+      case 'warn': return stmt(fragExpr('console.warn(' + logArgs(d.rest) + ')'));    // <@warn ...msg>
+      case 'throw': return fragStmts('throw (' + d.rest + ');')[0];                  // <@throw err>
+      case 'quit': return { type: 'Return', value: { type: 'Null' } };              // <@quit>
+      case 'dudret': return fragStmts('if (rand() < 0) { return (' + d.rest + '); }')[0]; // <@dudret v> dead return
+      case 'if': return stmt(fragExpr(ifExpr(d.rest)));
+      case 'exists': return stmt(fragExpr(existsExpr(d.rest)));
+      default: return null;
+    }
+  }
+  // Expression-position expansion (only the value-producing directives).
+  function expandDirectiveExpr(d) {
+    switch (d.name) {
+      case 'call': return fragExpr(d.rest);
+      case 'log': return fragExpr('console.log(' + logArgs(d.rest) + ')');
+      case 'warn': return fragExpr('console.warn(' + logArgs(d.rest) + ')');
+      case 'if': return fragExpr(ifExpr(d.rest));
+      case 'exists': return fragExpr(existsExpr(d.rest));
+      case 'dudret': return fragExpr(d.rest); // as a value, just the (dud) value
+      default: return null;
+    }
+  }
 
   // Parse a `{...}` / `[...]` binding pattern. Returns a Pattern descriptor that
   // `destructure()` desugars into plain Let/Assign statements against a source.
@@ -938,9 +1035,24 @@ function parse(src) {
   }
 
   function parsePrimary() {
+    // Single-parameter arrow with a name-like parameter, including keyword-alias
+    // tokens used as identifiers (e.g. `fn => …`, `of => …`). Must run before the
+    // `fn`/keyword handling so `fn` is treated as a parameter, not `function`.
+    // No literal is ever followed by `=>`, so this is unambiguous.
+    {
+      const t0 = toks[p], t1 = toks[p + 1];
+      if (t0 && t0.type !== 'ident' && atName() && t1 && t1.type === 'op' && t1.value === '=>') {
+        const name = eatName(); eatOp('=>'); return arrowBody([], false, [name]);
+      }
+    }
     // inline directives in expression position: <@encstr str mode> is a value;
     // other directives (e.g. <@name f>) attach to the following expression.
     if (at('directive')) {
+      // value-producing code directives (<@call>, <@if>, <@exists>, <@log>, ...)
+      if (CODE_DIRECTIVES.has(peek().value.name)) {
+        const node = expandDirectiveExpr(peek().value);
+        if (node) { next(); return node; }
+      }
       const ds = collectDirectives();
       const rnd = ds.find((d) => d.name === 'random');
       if (rnd) return randomNode(rnd.args[0], rnd.args[1]);
@@ -952,8 +1064,9 @@ function parse(src) {
         const MODES = { hex: 1, str_arr: 1, bytecode: 1, random: 1 };
         let mode = 'random', str = null;
         for (const a of enc.args) { const la = a.toLowerCase(); if (MODES[la]) mode = la; else if (str === null) str = a; }
-        if (str === null) { // prefix form: consume the following string literal
+        if (str === null) { // prefix form: consume the following literal
           if (at('str')) str = next().value;
+          else if (at('num')) return encNumNode(next().value); // <@encstr hex>42 -> runtime int
           else if (at('tpl_start')) { /* leave template as-is */ str = ''; }
           else str = '';
         }

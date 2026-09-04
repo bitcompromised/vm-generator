@@ -28,7 +28,7 @@ node "C:\Users\eadan\OneDrive\Documents\vm-builds\build.js"
 
 for %%A in ("%~1") do set "name=%%~nA"
 mkdir "C:\Users\eadan\OneDrive\Documents\vm-builds\vm\%name%\" 2>nul
-node "C:\Users\eadan\OneDrive\Desktop\Claude-Projects\vm-gen\bin\vm-gen.js" build "%1" -o "C:\Users\eadan\OneDrive\Documents\vm-builds\vm\%name%\%name%.vm.js" --flatten --bogus --split
+node "C:\Users\eadan\OneDrive\Desktop\Claude-Projects\vm-gen\bin\vm-gen.js" build "%1" -o "C:\Users\eadan\OneDrive\Documents\vm-builds\vm\%name%\%name%.vm.js" --flatten --bogus --split --profile aggressive
 copy %1 "C:\Users\eadan\OneDrive\Documents\vm-builds\vm\%name%\%name%.src.js"
 
 if errorlevel 1 (

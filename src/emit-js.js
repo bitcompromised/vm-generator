@@ -631,7 +631,60 @@ ${opConstBlock()}
   // forms are behaviour-identical; they differ in layout/complexity so the shape
   // of the loader varies per build. 'auto' derives the form from the seed.
   const formOpts = pickLoaderForm(opts);
-  return minifySource(randomizeIdentifiers(mutateHandlers(src, formOpts), formOpts), formOpts);
+  return minifySource(randomizeIdentifiers(mutateHandlers(obfuscateLoader(applyArch(src, opts), formOpts), formOpts), formOpts), formOpts);
+}
+
+// Architecture selection (#arch). The default 'stack-switch' engine keeps the
+// operand stack as a JS array with push/pop. A 'register*' architecture rewrites
+// it into an explicit REGISTER FILE (an indexed array `__R` addressed by a stack
+// pointer `__sp`) fronted by a thin adapter, so every opcode handler stays
+// byte-for-byte identical while the execution substrate becomes register-based.
+// Behaviour is unchanged; only the machine model differs. 'register-encrypted'
+// additionally masks the live stack-pointer with a per-build key.
+function applyArch(src, opts) {
+  const arch = (opts && opts.arch) || 'stack-switch';
+  if (!/^register/.test(arch)) return src;
+  let s = ((((opts.seed !== undefined ? opts.seed : (opts.salt || 0)) >>> 0) ^ 0x1b873593) >>> 0);
+  const rng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
+  const enc = /encrypt/.test(arch);
+  const KEY = (rng() & 0x3fffffff) >>> 0; // pointer mask for register-encrypted
+  // The adapter exposes the same surface the handlers use: push / pop / peek /
+  // length (get+set). The register file grows on demand. For the encrypted
+  // variant the pointer is held masked (m = real ^ KEY) and unmasked on use.
+  const adapter = enc
+    ? `    var __R = []; var __m = ${KEY};\n` +
+      `    var stack = { push: function (v) { var i = __m ^ ${KEY}; __R[i] = v; __m = (i + 1) ^ ${KEY}; },\n` +
+      `      pop: function () { var i = (__m ^ ${KEY}) - 1; __m = i ^ ${KEY}; return __R[i]; },\n` +
+      `      peek: function () { return __R[(__m ^ ${KEY}) - 1]; },\n` +
+      `      get length() { return __m ^ ${KEY}; }, set length(n) { __m = n ^ ${KEY}; } };`
+    : `    var __R = []; var __sp = 0;\n` +
+      `    var stack = { push: function (v) { __R[__sp++] = v; }, pop: function () { return __R[--__sp]; },\n` +
+      `      peek: function () { return __R[__sp - 1]; },\n` +
+      `      get length() { return __sp; }, set length(n) { __sp = n; } };`;
+  src = src.replace('    var stack = [];', adapter);
+  src = src.replace('stack[stack.length - 1]', 'stack.peek()');
+  return src;
+}
+
+// Loader obfuscation (#loader): inject a seeded number of dead, plausible-looking
+// helper declarations into the loader scope (never called, so semantics are
+// unchanged) and, for the 'split' form, wrap the whole VM in an extra IIFE layer.
+// Combined with pickLoaderForm (compact/verbose) and mutateHandlers this makes
+// the loader a per-build moving target. A no-op when opts is absent.
+function obfuscateLoader(src, opts) {
+  if (!opts) return src;
+  let s = ((((opts.seed !== undefined ? opts.seed : (opts.salt || 0)) >>> 0) ^ 0x2f9a1c7d) >>> 0);
+  const rng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
+  const rid = () => { const a = 'abcdefghijklmnopqrstuvwxyz'; let n = '_' + a[rng() % 26]; for (let i = 0; i < 6; i++) n += (a + '0123456789')[rng() % 36]; return n; };
+  const K = 2 + (rng() % 5); // 2..6 dead helpers
+  let dead = '';
+  for (let i = 0; i < K; i++) {
+    if (rng() % 2) dead += `  function ${rid()}(a, b){ var t = ((a | 0) + ${rng() % 997}) ^ (b | 0); return (t >>> ${1 + (rng() % 7)}) & 0xffff; }\n`;
+    else dead += `  var ${rid()} = ${rng() % 0xffff};\n`;
+  }
+  src = src.replace('(function () {\n', '(function () {\n' + dead);
+  if (opts._loaderForm === 'split') src = '(function () {\n' + src + '\n})();\n';
+  return src;
 }
 
 // Resolve loaderForm into concrete render toggles (mutateHandlers + minify).

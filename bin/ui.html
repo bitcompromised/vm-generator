@@ -115,6 +115,14 @@
               <option value="split">split (many fns)</option>
             </select>
           </label>
+          <label>architecture
+            <select id="i_arch">
+              <option value="stack-switch">stack-switch</option>
+              <option value="register">register</option>
+              <option value="register-threaded">register-threaded</option>
+              <option value="register-encrypted">register-encrypted</option>
+            </select>
+          </label>
         </div>
         <div class="row">
           <label>cipher rounds (default)
@@ -139,6 +147,7 @@
           <label>encrypt strings
             <select id="c_encstr"><option>none</option><option>str_arr</option><option>hex</option><option>bytecode</option><option>random</option></select>
           </label>
+          <label><input type="checkbox" id="c_encnum"> encrypt numbers</label>
           <label><input type="checkbox" id="c_dud"> decoy functions</label>
           <label>count <input type="number" id="c_dudcount" min="0" max="64" value="4"></label>
         </div>
@@ -154,11 +163,15 @@
       <div id="stats" class="hint">Build to see output.</div>
       <div class="tabs">
         <button data-tab="summary" class="active">Summary</button>
+        <button data-tab="map">Map</button>
+        <button data-tab="added">Added</button>
         <button data-tab="source">VM source</button>
         <button data-tab="error">Errors</button>
         <button class="ghost" id="dlBtn" style="margin-left:auto">Download VM</button>
       </div>
       <div id="tab-summary" class="out"></div>
+      <div id="tab-map" class="out" hidden></div>
+      <div id="tab-added" class="out" hidden></div>
       <div id="tab-source" class="out" hidden></div>
       <div id="tab-error" class="err" hidden></div>
     </div>
@@ -167,7 +180,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let lastOutput = '', lastAnalyzeOptimize = null;
+let lastOutput = '', lastAnalyzeOptimize = null, lastAnalysis = null;
 const perFn = {}; // index -> {flatten,split,bogus,protLevel}
 
 async function api(url, body) {
@@ -223,11 +236,41 @@ async function analyze(){
   const list = $('fnlist'); list.innerHTML='';
   if (!res.ok){ list.innerHTML = `<div class="err">${res.error}</div>`; $('bulk').hidden=true; return; }
   lastAnalyzeOptimize = res.result.optimize;
+  lastAnalysis = res.result.functions;
   // preserve existing perFn entries only when index count matches
   res.result.functions.forEach(fn=> list.appendChild(fnCard(fn)));
   $('bulk').hidden = false;
+  renderMap(lastAnalysis);
 }
 $('analyzeBtn').onclick = analyze;
+
+const ID_COLOR = { vm:'#ff9e64', nativejs:'#7ee0a2', client:'#5b9dff', deadcode:'#ff6b6b' };
+// Map: a scope / closure tree — root(vm) -> functions -> nested closures, each
+// node showing its variables (params/locals) and captured upvalues.
+function renderMap(fns){
+  const box = $('tab-map');
+  if (!fns || !fns.length){ box.innerHTML = '<span class="hint">Analyze or build to see the map.</span>'; return; }
+  const kids = {}; fns.forEach(f=>{ const p = (f.parent==null?-1:f.parent); (kids[p]=kids[p]||[]).push(f); });
+  const esc = (s)=> String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  const nodeHtml = (f, depth)=>{
+    const col = ID_COLOR[f.identity]||'#5b9dff';
+    const vars = [];
+    if (f.params && f.params.length) vars.push('<span style="color:#9aa4b2">params</span> '+esc(f.params.join(', ')));
+    if (f.locals && f.locals.length) vars.push('<span style="color:#9aa4b2">locals</span> '+esc(f.locals.join(', ')));
+    const ups = (f.upvalues&&f.upvalues.length)? '<div style="color:#ffb454;font-size:11px">↳ captures: '+esc(f.upvalues.join(', '))+'</div>':'';
+    let h = `<div style="margin-left:${depth*22}px;border-left:3px solid ${col};padding:4px 8px;margin-top:6px;background:#141821;border-radius:5px">`+
+      `<div><span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${col};margin-right:6px"></span>`+
+      `<b style="font-family:ui-monospace,monospace">${esc(f.name)}</b> <span style="color:#9aa4b2;font-size:11px">#${f.index} · ${f.identity}${f.async?' · async':''}${f.generator?' · gen':''}</span></div>`+
+      (vars.length? '<div style="font-family:ui-monospace,monospace;font-size:11px;color:#e6e9ef">'+vars.join(' &nbsp; ')+'</div>':'')+ ups + '</div>';
+    const cs = kids[f.index]||[];
+    for (const c of cs) h += nodeHtml(c, depth+1);
+    return h;
+  };
+  const roots = (kids[-1]||[]).concat(fns.filter(f=>f.parent!=null && f.parent>=0 && !fns[f.parent]));
+  let html = '<div style="font-size:11px;color:#9aa4b2;margin-bottom:6px">variables → functions → closures/nests · colour = identity (vm / nativejs / client)</div>';
+  for (const r of (kids[-1]||[])) html += nodeHtml(r, 0);
+  box.innerHTML = html;
+}
 
 $('bulk').onclick = (e)=>{
   const cmd = e.target.getAttribute('data-all'); if(!cmd) return;
@@ -253,11 +296,11 @@ function collectBuildBody(){
     source:$('source').value, target:$('target').value, seed:$('seed').value,
     profile:$('profile').value, prod:$('prod').checked,
     interpreter:{ permute:$('i_permute').checked, fuse:$('i_fuse').checked, conceal:$('i_conceal').checked,
-      mutateHandlers:$('i_mutate').checked, loaderForm:$('i_loader').value,
+      mutateHandlers:$('i_mutate').checked, loaderForm:$('i_loader').value, arch:$('i_arch').value,
       cipherRounds: cipher===''?undefined:parseInt(cipher,10),
       randomize:$('i_randomize').checked, minify:$('i_minify').checked },
     child:{ flatten:$('c_flatten').checked, split:$('c_split').checked, bogus:parseInt($('c_bogus').value,10),
-      encStr:$('c_encstr').value, dud:$('c_dud').checked, dudCount:parseInt($('c_dudcount').value,10),
+      encStr:$('c_encstr').value, encNum:$('c_encnum').checked, dud:$('c_dud').checked, dudCount:parseInt($('c_dudcount').value,10),
       renameSymbols:$('c_rename').checked, optimize:$('c_optimize').checked },
     perFn: perFnPayload,
   };
@@ -278,15 +321,37 @@ async function build(){
     `<span class="stat">image <b>${s.imageSize}</b>B</span>`+
     `<span class="stat"><b>${s.renameCount}</b> renamed</span>`+
     `<span class="stat"><b>${s.encStrCount}</b> enc-str</span>`+
+    `<span class="stat"><b>${s.encNumCount||0}</b> enc-num</span>`+
     `<span class="stat">${s.target} · ${s.checksum}</span>`;
   $('tab-summary').textContent = res.summary;
   $('tab-source').textContent = res.output;
+  renderAdded(res);
+  // build the map: prefer the scope-rich analyze data; fall back to build fns
+  if (lastAnalysis) renderMap(lastAnalysis);
+  else renderMap((res.functions||[]).map(f=>({ index:f.index, name:f.name, identity:f.identity, parent:f.index===0?-1:0, params:[], locals:[], upvalues:[] })));
   showTab('summary');
 }
 $('buildBtn').onclick = build;
 
+// Added tab: the names/consts protection injected + the decoy "source".
+function renderAdded(res){
+  const esc = (s)=> String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  let h = '';
+  const rm = res.renameMap||{};
+  const rk = Object.keys(rm);
+  h += `<div style="color:#7ee0a2">## Renamed symbols (original → added name)  [${rk.length}]</div>`;
+  h += rk.length? rk.map(k=>`  ${esc(k)}  →  ${esc(rm[k])}`).join('\n') : '  (renaming disabled)';
+  const cs = res.consts||[];
+  h += `\n\n<div style="color:#7ee0a2">## Constant pool  [${cs.length}${cs.length>=400?'+ (truncated)':''}]</div>`;
+  h += cs.map((c,i)=>`  [${i}] ${esc(c)}`).join('\n');
+  const dc = res.decoys||[];
+  h += `\n\n<div style="color:#7ee0a2">## Decoy functions (source)  [${dc.length}]</div>`;
+  h += dc.map(d=>`  ${esc(d.name)}(${d.nparams}p ${d.nlocals}l, ${d.protLevel} rounds):\n`+ (d.ops||[]).map(o=>'      '+esc(o)).join('\n')).join('\n\n') || '  (none)';
+  $('tab-added').innerHTML = h;
+}
+
 function showTab(name){
-  for (const t of ['summary','source','error']) $('tab-'+t).hidden = (t!==name);
+  for (const t of ['summary','map','added','source','error']) $('tab-'+t).hidden = (t!==name);
   document.querySelectorAll('.tabs button[data-tab]').forEach(b=> b.classList.toggle('active', b.getAttribute('data-tab')===name));
 }
 document.querySelectorAll('.tabs button[data-tab]').forEach(b=> b.onclick=()=>showTab(b.getAttribute('data-tab')));
