@@ -1,0 +1,643 @@
+vm-gen build summary
+================================================================
+
+## Configuration
+  target        js
+  profile       aggressive
+  format        2.0   protection v2
+  optimize      true
+  permute       randomized
+  flatten CF    true
+  bogus CF      level 2
+  split blocks  true
+  cipher rounds 2 per function
+  fuse opcodes  true
+  conceal ints  true
+  encrypt str   random (3 literals reconstructed at runtime)
+  encrypt num   on (24 integer literals -> XOR reconstruction)
+  dead-code     5 decoy function(s)
+  seeds/perm    derived (not stored in payload)
+  rename all    on
+  signed        false
+  limits        steps=200000000 depth=512 objects=5000000 string=33554432
+
+## Source (input)
+----------------------------------------------------------------
+function <@split>greet(name) {
+  const greeting = "Hello, " + name + "!"; // build message
+  return greeting;
+}
+<@bogus 10>
+function factoriala(n) {
+  let result = 1;
+  for (let i = 2; i <= n; i++) {
+    result = result * i;
+  }
+  return result;
+}
+<@virtualization max>
+function factorialb(n) {
+  let result = 1;
+  for (let i = 2; i <= n; i++) {
+    result = result * i;
+  }
+  return result;
+}
+
+const <@name testtwo>secret = "top-secret-token-44";
+var test = 5+7;
+test += 9;
+console.log( greet(<@encstr MuaHaHaHaHaHa hex>), factoriala(5), secret);
+
+## Symbol rename table (original -> obfuscated)
+----------------------------------------------------------------
+  $main                    -> _Vx6zwJ8l6Xy
+  greet                    -> _BHktYz6
+  factoriala               -> _p3cbKBs
+  factorialb               -> _dDUxmBY
+
+## Functions
+----------------------------------------------------------------
+#0  $main   <vm>   (compiled as: _Vx6zwJ8l6Xy)
+    identity vm | params 0 | locals 0 | level medium
+    scope: (none)
+    obfuscation: flat, bogus:2, split  (+74 instructions added by passes)
+    bytecode:
+         0  PUSH_CONST  0
+         2  PUSH_CONST  1
+         4  JMP  10
+         6  DUP
+         7  PUSH_CONST  2
+         9  JMP  17
+        11  PUSH_FALSE
+        12  BXOR
+        13  JMP  21
+        15  CALL_HOST  3, 2
+        18  POP
+        19  PUSH_CONST  0
+        21  PUSH_CONST  0
+        23  CALL_HOST  4, 1
+        26  PUSH_CONST  5
+        28  PUSH_CONST  6
+        30  BXOR
+        31  ADD
+        32  JMP  47
+        34  CALL_HOST  3, 2
+        37  POP
+        38  JMP  57
+        40  DUP
+        41  DUP
+        42  PUSH_CONST  7
+        44  CALL_HOST  4, 1
+        47  DUP
+        48  JMP  71
+        50  PUSH_TRUE
+        51  POP
+        52  PUSH_NULL
+        53  PUSH_CONST  8
+        55  ARR_GET
+        56  JMP  80
+        58  PUSH_FALSE
+        59  PUSH_FALSE
+        60  PUSH_CONST  9
+        62  PUSH_CONST  10
+        64  JMP  89
+        66  BXOR
+        67  PUSH_CONST  11
+        69  PUSH_CONST  12
+        71  BXOR
+        72  PUSH_CONST  13
+        74  JMP  103
+        76  PUSH_CONST  14
+        78  BXOR
+        79  PUSH_CONST  15
+        81  PUSH_CONST  16
+        83  BXOR
+        84  PUSH_CONST  17
+        86  JMP  120
+        88  PUSH_CONST  18
+        90  JMP  129
+        92  POP
+        93  DUP
+        94  DUP
+        95  BXOR
+        96  JMP  134
+        98  DUP
+        99  PUSH_CONST  19
+       101  PUSH_CONST  20
+       103  BXOR
+       104  PUSH_CONST  21
+       106  JMP  148
+       108  PUSH_FALSE
+       109  PUSH_CONST  22
+       111  BXOR
+       112  JMP  158
+       114  PUSH_NULL
+       115  PUSH_FALSE
+       116  DUP
+       117  PUSH_CONST  23
+       119  JMP  164
+       121  PUSH_CONST  24
+       123  BXOR
+       124  PUSH_CONST  25
+       126  JMP  177
+       128  DUP
+       129  POP
+       130  PUSH_NULL
+       131  PUSH_CONST  26
+       133  JMP  186
+       135  PUSH_NULL
+       136  PUSH_NULL
+       137  POP
+       138  BXOR
+       139  PUSH_CONST  27
+       141  JMP  193
+       143  PUSH_CONST  28
+       145  JMP  199
+       147  BXOR
+       148  PUSH_CONST  29
+       150  JMP  207
+       152  POP
+       153  PUSH_CONST  30
+       155  BXOR
+       156  PUSH_CONST  31
+       158  JMP  218
+       160  POP
+       161  PUSH_CONST  32
+       163  JMP  226
+       165  PUSH_NULL
+       166  POP
+       167  BXOR
+       168  PUSH_CONST  33
+       170  PUSH_CONST  34
+       172  BXOR
+       173  JMP  237
+       175  CALL_METHOD  13
+       177  CALL  1, 1
+       180  JMP  249
+       182  PUSH_NULL
+       183  PUSH_TRUE
+       184  POP
+       185  PUSH_CONST  35
+       187  JMP  255
+       189  ADD
+       190  JMP  262
+       193  PUSH_NULL
+       194  DUP
+       195  PUSH_FALSE
+       196  PUSH_CONST  36
+       198  JMP  269
+       201  PUSH_TRUE
+       202  PUSH_CONST  37
+       204  BXOR
+       205  JMP  278
+       208  PUSH_TRUE
+       209  DUP
+       210  CALL  2, 1
+       213  ADD
+       214  CONSTADD  35
+       216  PUSH_CONST  7
+       218  CALL_HOST  4, 1
+       221  DUP
+       222  JMP  299
+       225  PUSH_NULL
+       226  PUSH_NULL
+       227  PUSH_CONST  8
+       229  ARR_GET
+       230  PUSH_CONST  38
+       232  JMP  312
+       235  POP
+       236  POP
+       237  PUSH_FALSE
+       238  PUSH_CONST  39
+       240  PUSH_CONST  40
+       242  PUSH_CONST  41
+       244  PUSH_CONST  42
+       246  PUSH_CONST  43
+       248  PUSH_CONST  44
+       250  JMP  334
+       253  DUP
+       254  PUSH_CONST  45
+       256  PUSH_CONST  43
+       258  PUSH_CONST  38
+       260  PUSH_CONST  41
+       262  PUSH_CONST  38
+       264  PUSH_CONST  39
+       266  PUSH_CONST  46
+       268  PUSH_CONST  43
+       270  JMP  361
+       273  PUSH_CONST  47
+       275  PUSH_CONST  41
+       277  PUSH_CONST  48
+       279  PUSH_CONST  48
+       281  JMP  376
+       284  CALL_METHOD  19
+       286  ADD
+       287  PRINT
+       288  PUSH_NULL
+       289  POP
+       290  HALT
+
+#1  greet   <client>   (compiled as: _BHktYz6)
+    identity client | params 1 | locals 2 | level medium
+    scope: [0] name (param), [1] greeting
+    obfuscation: flat, bogus:2, split  (+25 instructions added by passes)
+    bytecode:
+         0  PUSH_CONST  7
+         2  CALL_HOST  4, 1
+         5  JMP  12
+         7  PUSH_NULL
+         8  POP
+         9  DUP
+        10  JMP  19
+        12  POP
+        13  POP
+        14  DUP
+        15  PUSH_CONST  8
+        17  ARR_GET
+        18  PUSH_CONST  49
+        20  PUSH_CONST  43
+        22  JMP  33
+        24  DUP
+        25  PUSH_CONST  50
+        27  PUSH_CONST  50
+        29  PUSH_CONST  39
+        31  PUSH_CONST  51
+        33  JMP  50
+        35  POP
+        36  PUSH_NULL
+        37  PUSH_CONST  52
+        39  CALL_METHOD  7
+        41  JMP  59
+        43  POP
+        44  LOAD  0
+        46  JMP  65
+        48  ADD
+        49  PUSH_CONST  53
+        51  NEW_ARR  1
+        53  DUP
+        54  JMP  77
+        56  DUP
+        57  PUSH_CONST  54
+        59  ARR_GET
+        60  PUSH_CONST  55
+        62  CALL_METHOD  1
+        64  JMP  91
+        66  POP
+        67  POP
+        68  ADD
+        69  STORE  1
+        71  LOAD  1
+        73  JMP  101
+        75  RET
+        76  DUP
+        77  POP
+        78  PUSH_NULL
+        79  RET
+        80  PUSH_TRUE
+        81  POP
+
+#2  factoriala   <client>   (compiled as: _p3cbKBs)
+    identity client | params 1 | locals 3 | level medium
+    scope: [0] n (param), [1] result, [2] i
+    obfuscation: flat, bogus:2, split  (+42 instructions added by passes)
+    bytecode:
+         0  PUSH_CONST  56
+         2  JMP  7
+         4  PUSH_FALSE
+         5  PUSH_CONST  57
+         7  BXOR
+         8  STORE  1
+        10  PUSH_CONST  58
+        12  JMP  21
+        14  PUSH_TRUE
+        15  PUSH_CONST  59
+        17  JMP  30
+        19  PUSH_NULL
+        20  PUSH_TRUE
+        21  PUSH_NULL
+        22  BXOR
+        23  JMP  34
+        25  STORE  2
+        27  JMP  59
+        29  PUSH_TRUE
+        30  LOAD  1
+        32  JMP  50
+        34  PUSH_TRUE
+        35  PUSH_TRUE
+        36  PUSH_TRUE
+        37  RET
+        38  PUSH_NULL
+        39  JMP  58
+        41  PUSH_TRUE
+        42  POP
+        43  DUP
+        44  RET
+        45  LOAD  2
+        47  JMP  65
+        49  LOAD  0
+        51  LTE
+        52  JZ  41
+        54  JMP  75
+        56  LOAD  1
+        58  LOAD  2
+        60  JMP  87
+        62  PUSH_TRUE
+        63  PUSH_NULL
+        64  PUSH_TRUE
+        65  MUL
+        66  JMP  92
+        68  PUSH_TRUE
+        69  STORE  1
+        71  JMP  101
+        73  PUSH_NULL
+        74  DUP
+        75  PUSH_TRUE
+        76  LOAD  2
+        78  JMP  107
+        80  PUSH_CONST  60
+        82  JMP  115
+        84  DUP
+        85  PUSH_NULL
+        86  PUSH_CONST  61
+        88  BXOR
+        89  ADD
+        90  JMP  123
+        92  DUP
+        93  JMP  128
+        95  PUSH_NULL
+        96  STORE  2
+        98  PUSH_CONST  62
+       100  JMP  139
+       102  POP
+       103  POP
+       104  PUSH_CONST  63
+       106  BXOR
+       107  SUB
+       108  POP
+       109  JMP  148
+       111  JMP  59
+
+#3  factorialb   <client>   (compiled as: _dDUxmBY)
+    identity client | params 1 | locals 3 | level heavy
+    scope: [0] n (param), [1] result, [2] i
+    obfuscation: flat, bogus:2, split  (+26 instructions added by passes)
+    bytecode:
+         0  PUSH_CONST  64
+         2  JMP  8
+         4  PUSH_TRUE
+         5  PUSH_NULL
+         6  PUSH_CONST  65
+         8  BXOR
+         9  STORE  1
+        11  PUSH_CONST  66
+        13  PUSH_CONST  67
+        15  BXOR
+        16  STORE  2
+        18  JMP  101
+        20  PUSH_FALSE
+        21  LOAD  1
+        23  JMP  37
+        25  PUSH_NULL
+        26  PUSH_TRUE
+        27  RET
+        28  PUSH_NULL
+        29  JMP  44
+        31  PUSH_TRUE
+        32  PUSH_TRUE
+        33  RET
+        34  PUSH_TRUE
+        35  LOAD  1
+        37  LOAD  2
+        39  JMP  55
+        41  MUL
+        42  STORE  1
+        44  LOAD  2
+        46  PUSH_CONST  68
+        48  PUSH_CONST  69
+        50  BXOR
+        51  ADD
+        52  DUP
+        53  JMP  74
+        55  STORE  2
+        57  PUSH_CONST  70
+        59  JMP  86
+        61  DUP
+        62  PUSH_FALSE
+        63  PUSH_FALSE
+        64  PUSH_CONST  71
+        66  BXOR
+        67  SUB
+        68  JMP  97
+        70  DUP
+        71  PUSH_NULL
+        72  PUSH_TRUE
+        73  POP
+        74  JMP  101
+        76  LOAD  2
+        78  LOAD  0
+        80  LTE
+        81  JZ  29
+        83  JMP  46
+        85  PUSH_NULL
+        86  PUSH_FALSE
+        87  PUSH_TRUE
+
+## Constant pool
+----------------------------------------------------------------
+  [0] "test"
+  [1] 1841694925
+  [2] 1841694913
+  [3] "__setglobal"
+  [4] "__getglobal"
+  [5] 2466517960
+  [6] 2466517953
+  [7] "String"
+  [8] "fromCharCode"
+  [9] 1108190343
+  [10] 1108190410
+  [11] 400365626
+  [12] 400365647
+  [13] 3891939921
+  [14] 3891939888
+  [15] 4289331068
+  [16] 4289330996
+  [17] 3875034283
+  [18] 3875034314
+  [19] 762995214
+  [20] 762995270
+  [21] 3793060373
+  [22] 3793060468
+  [23] 4251446384
+  [24] 4251446328
+  [25] 2581239055
+  [26] 2581239150
+  [27] 2992865058
+  [28] 2992865130
+  [29] 1517679641
+  [30] 1517679736
+  [31] 2854178468
+  [32] 2854178540
+  [33] 123685299
+  [34] 123685330
+  [35] " "
+  [36] 3323855734
+  [37] 3323855731
+  [38] 116
+  [39] 111
+  [40] 112
+  [41] 45
+  [42] 115
+  [43] 101
+  [44] 99
+  [45] 114
+  [46] 107
+  [47] 110
+  [48] 52
+  [49] 72
+  [50] 108
+  [51] 44
+  [52] 32
+  [53] "!"
+  [54] "join"
+  [55] ""
+  [56] 858560645
+  [57] 858560644
+  [58] 2138353696
+  [59] 2138353698
+  [60] 1722328319
+  [61] 1722328318
+  [62] 3248746066
+  [63] 3248746067
+  [64] 2830678409
+  [65] 2830678408
+  [66] 2250110292
+  [67] 2250110294
+  [68] 4041728163
+  [69] 4041728162
+  [70] 3416346022
+  [71] 3416346023
+
+## Added code (what protection generated)
+----------------------------------------------------------------
+  obfuscation passes   +167 instructions total (flat/bogus/split/close-upvalue)
+
+  #0 $main  [flat, bogus:2, split]  100 -> 174 instructions (+74)
+      added opcodes: JMP x33, DUP x11, PUSH_FALSE x7, POP x10, PUSH_TRUE x4, PUSH_NULL x10, CONSTADD x1
+  #1 greet  [flat, bogus:2, split]  28 -> 53 instructions (+25)
+      added opcodes: JMP x9, PUSH_NULL x2, POP x9, DUP x4, PUSH_TRUE x1
+  #2 factoriala  [flat, bogus:2, split]  33 -> 75 instructions (+42)
+      added opcodes: JMP x18, PUSH_FALSE x1, PUSH_TRUE x11, PUSH_NULL x6, POP x3, DUP x3
+  #3 factorialb  [flat, bogus:2, split]  33 -> 59 instructions (+26)
+      added opcodes: JMP x9, PUSH_TRUE x7, PUSH_NULL x4, PUSH_FALSE x4, DUP x2
+
+  string encryption    3 literal(s) rewritten into runtime reconstruction code
+                       (String.fromCharCode / Array.join expressions instead of plaintext)
+  decoy functions      5 inert "dud" function(s) appended to the datastream:
+                       - well-formed, permuted, RET-terminated bytecode (result of <@deadcode>/--dud)
+                       - never referenced by any CALL/CLOSURE, so never run
+                       - covered by the function-integrity domain like real code
+    decoy#0 flushDispatch(3 params, 7 locals, 1 cipher rounds):
+        STORE_UPVALUE 53
+        ARR_GET
+        JMP 10
+        NEW 20, 0
+        PUSH_NULL
+        RET
+    decoy#1 auditTable(1 params, 1 locals, 3 cipher rounds):
+        AWAIT
+        JMP 70
+        LOAD_ARGS
+        NOT
+        NEW 68, 0
+        DUP
+        TRY 40
+        CALL 58, 0
+        LOAD_UP 59
+        BAND
+        LOAD_THIS
+        GTE
+        NEW_VALUE 0
+        CALL_VALUE 0
+        PUSH_NULL
+        RET
+    decoy#2 resolveBinding(2 params, 5 locals, 0 cipher rounds):
+        STORE_UP 25
+        NEW_ARR 67
+        POP
+        EQ
+        STORE 23
+        LOADLT 49
+        AWAIT
+        JMP 45
+        LOAD_UPVALUE 71
+        MOD
+        LOADLT 68
+        LOAD_UPVALUE 62
+        AWAIT
+        JNZ 63
+        LOAD_UP 57
+        PUSH_NULL
+        RET
+    decoy#3 validateLicense(3 params, 7 locals, 1 cipher rounds):
+        LOAD_UP 2
+        SHL
+        CLOSE_UPVALUE 59
+        THROW
+        NEW 56, 6
+        SUB
+        LT
+        STORE 3
+        PUSH_NULL
+        RET
+    decoy#4 verifyManifest(1 params, 1 locals, 3 cipher rounds):
+        NEW_ARR 20
+        SHL
+        JMP 5
+        PUSH_TRUE
+        NEW_ARR 34
+        DUP
+        GTE
+        EQ
+        NEQ
+        STORE_UPVALUE 40
+        PUSH_NULL
+        RET
+  symbol renaming      4 names -> opaque randoms
+  VM randomization     internal VM identifiers randomized + minified per build
+
+## Recognized bytecode patterns
+----------------------------------------------------------------
+  Hot adjacent-opcode sequences (fusion / opcode-randomization candidates).
+  fusion: ON (matching bigrams collapsed into superinstructions)
+  top bigrams:
+      30x  PUSH_CONST JMP
+      29x  PUSH_CONST PUSH_CONST
+      17x  PUSH_CONST BXOR
+      12x  JMP PUSH_NULL
+      11x  JMP DUP
+      11x  JMP PUSH_TRUE
+      10x  BXOR PUSH_CONST
+       9x  JMP POP
+       8x  DUP PUSH_CONST
+       8x  LOAD JMP
+  top trigrams:
+      14x  PUSH_CONST PUSH_CONST PUSH_CONST
+       7x  PUSH_CONST PUSH_CONST JMP
+       7x  PUSH_CONST PUSH_CONST BXOR
+       7x  BXOR PUSH_CONST JMP
+       6x  PUSH_CONST JMP DUP
+       6x  PUSH_CONST BXOR PUSH_CONST
+       6x  PUSH_CONST JMP POP
+       5x  JMP DUP PUSH_CONST
+       5x  PUSH_CONST JMP PUSH_CONST
+       4x  JMP POP POP
+
+## Statistics
+----------------------------------------------------------------
+  real functions      4
+  decoy functions     5
+  total instructions  361  (167 added by obfuscation passes)
+  constants           72
+  image size          1892 bytes
+  checksum            0xc95f2fc5  (+ 4 integrity domains)
