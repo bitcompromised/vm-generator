@@ -64,6 +64,8 @@ const OPCODES = [
   ['CALL_VALUE',     ['u8']],    // call a closure value with argc args (callee below args)
   // ---- method / this support ----
   ['LOAD_THIS',      []],        // push current frame's this binding
+  ['LOAD_ARGS',      []],        // push current frame's arguments array (varargs)
+  ['YIELD',          []],        // generator: append top-of-stack to the frame's yield list
   ['CALL_METHOD',    ['u8']],    // call a method with receiver below callee and argc args
   ['NEW',            ['u16','u8']], // new fnIdx argc -> alloc instance, set proto, call ctor
   ['NEW_VALUE',      ['u8']],    // new <value>(argc) -> callee is value on stack

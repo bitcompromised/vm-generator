@@ -291,6 +291,13 @@ async function interpret(program, opts = {}) {
       case '__new': return hostNew(args);
       case '__defaccessor': { const o = args[0]; if (isObj(o)) { if (args[2] === 'get') { (o.__getters || (o.__getters = {}))[args[1]] = args[3]; } else { (o.__setters || (o.__setters = {}))[args[1]] = args[3]; } } return o; }
       case '__regex': { try { return new RegExp(args[0], args[1] || ''); } catch (_) { return null; } }
+      case '__extend': {
+        const a = args[0], it = args[1];
+        if (Array.isArray(it) || typeof it === 'string') { for (let i = 0; i < it.length; i++) a.push(it[i]); }
+        else if (it && typeof Symbol !== 'undefined' && typeof it[Symbol.iterator] === 'function') { const iter = it[Symbol.iterator](); let st; while (!(st = iter.next()).done) a.push(st.value); }
+        else if (isObj(it)) { for (const k of it.keys) a.push(it.get(k)); }
+        return a;
+      }
       default: throw new Error('unknown host builtin ' + name);
     }
   }
@@ -328,6 +335,16 @@ async function interpret(program, opts = {}) {
   // Wrap a VM closure as a real JS callable so it can be passed to native host
   // methods (Array.map, Promise.then, ...). Native code invokes it like any
   // function; we re-enter the VM synchronously to compute the result.
+  // Run an async VM function and return a REAL JS promise for its result, so
+  // `.then`/`.catch`/`.finally` and `await` are native operations. Tracked so it
+  // is drained before the program returns.
+  function spawnAsync(fnIdx, argc, upvals, thisObj) {
+    const jsP = Promise.resolve(runFrameAsync(fnIdx, argc, upvals || [], thisObj != null ? thisObj : null));
+    pendingAsync.push(jsP);
+    jsP.catch(() => {}); // rejection is surfaced at the await point
+    return jsP;
+  }
+
   function toNative(v) {
     if (isClosure(v)) {
       const np = (fns[v.fn] && fns[v.fn].nparams) || 0;
@@ -340,20 +357,31 @@ async function interpret(program, opts = {}) {
     return v;
   }
 
+  // Pop argc arguments from the stack, bind params (extra ignored), collect a
+  // rest param into an array, and return the full args list (for LOAD_ARGS).
+  function bindFrameArgs(fn, locals, argc) {
+    const args = new Array(argc);
+    for (let k = argc - 1; k >= 0; k--) args[k] = stack.pop();
+    for (let k = 0; k < fn.nparams; k++) locals[k].v = (k < args.length ? args[k] : null);
+    if (fn.restParam != null && fn.restParam >= 0) locals[fn.restParam].v = args.slice(fn.restParam);
+    return args;
+  }
+
   function makeFrame(fnIdx, argc, upvals) {
     const callee = fns[fnIdx];
     const locals = mkCells(callee.nlocals);
-    for (let k = argc - 1; k >= 0; k--) { const kv = stack.pop(); if (k < callee.nparams) locals[k].v = kv; }
+    const args = bindFrameArgs(callee, locals, argc);
     frames.push(frame);
-    return { idx: fnIdx, fn: callee, i: 0, locals, upvals: upvals || [] };
+    return { idx: fnIdx, fn: callee, i: 0, locals, upvals: upvals || [], args };
   }
 
   // Lightweight synchronous frame runner (used for non-async calls inside async runner)
   function runFrameSync(fnIdx, argc, upvals, thisObj) {
     const localFn = fns[fnIdx];
     const locals = mkCells(localFn.nlocals);
-    for (let k = argc - 1; k >= 0; k--) { const kv = stack.pop(); if (k < localFn.nparams) locals[k].v = kv; }
-    const localFrame = { idx: fnIdx, fn: localFn, i: 0, locals, upvals: upvals || [], thisObj: thisObj || null };
+    const __args = bindFrameArgs(localFn, locals, argc);
+    const localFrame = { idx: fnIdx, fn: localFn, i: 0, locals, upvals: upvals || [], thisObj: thisObj || null, args: __args };
+    if (localFn.generator) localFrame.yields = []; // collect yields; returned at RET
     const localStack = [];
     const localMaps = maps[fnIdx];
     const localHandlers = [];
@@ -407,14 +435,7 @@ async function interpret(program, opts = {}) {
           for (let k = argc - 1; k >= 0; k--) args[k] = localStack.pop();
           // if target is async, return a VM promise immediately (like JS)
           if (targetFn.async) {
-            for (let k = 0; k < argc; k++) localStack.push(args[k]);
-            const vmPromise = alloc(new VMObj()); vmPromise.__promise = true;
-            const jsP = runFrameAsync(fnIdx, argc, [], null);
-            vmPromise.jsPromise = jsP; pendingAsync.push(jsP);
-            jsP.then((res) => { scheduleMicro(() => { vmPromise.resolved = res; }); }).catch((err) => { scheduleMicro(() => { vmPromise.rejected = err; }); });
-            // expose a VM-visible 'then' method as a host-backed closure so method calls work
-            vmPromise.set('then', { __closure: true, __host: 'promiseThen', __promiseRef: vmPromise });
-            localStack.push(vmPromise);
+            localStack.push(spawnAsync(fnIdx, argc, [], null));
           } else {
             // call synchronously via runFrameSync
             for (let k = 0; k < argc; k++) localStack.push(args[k]);
@@ -434,12 +455,7 @@ async function interpret(program, opts = {}) {
           if (!isClosure(callee)) throw new Error('value is not callable: ' + toStr(callee));
           const target = fns[callee.fn];
           if (target.async) {
-            for (let k = 0; k < argc; k++) localStack.push(args[k]);
-            const vmPromise = alloc(new VMObj()); vmPromise.__promise = true;
-            const jsP = runFrameAsync(callee.fn, argc, callee.upvals, null);
-            vmPromise.jsPromise = jsP; pendingAsync.push(jsP);
-            jsP.then((res) => { scheduleMicro(() => { vmPromise.resolved = res; }); }).catch((err) => { scheduleMicro(() => { vmPromise.rejected = err; }); });
-            localStack.push(vmPromise);
+            localStack.push(spawnAsync(callee.fn, argc, callee.upvals, null));
           } else {
             for (let k = 0; k < argc; k++) localStack.push(args[k]);
             const rv = runFrameSync(callee.fn, argc, callee.upvals, null);
@@ -452,6 +468,8 @@ async function interpret(program, opts = {}) {
           localStack.push(localFrame.thisObj !== undefined ? localFrame.thisObj : null);
           break;
         }
+        case OP.LOAD_ARGS: { localStack.push(localFrame.args || []); break; }
+        case OP.YIELD: { const yv = localStack.pop(); if (localFrame.yields) localFrame.yields.push(yv); localStack.push(null); break; }
         case OP.CALL_METHOD: {
           const argc = a[0];
           const args = new Array(argc);
@@ -462,12 +480,7 @@ async function interpret(program, opts = {}) {
           if (!isClosure(callee)) throw new Error('value is not callable: ' + toStr(callee));
           const target = fns[callee.fn];
           if (target.async) {
-            for (let k = 0; k < argc; k++) localStack.push(args[k]);
-            const vmPromise = alloc(new VMObj()); vmPromise.__promise = true;
-            const jsP = runFrameAsync(callee.fn, argc, callee.upvals, receiver);
-            vmPromise.jsPromise = jsP; pendingAsync.push(jsP);
-            jsP.then((res) => { scheduleMicro(() => { vmPromise.resolved = res; }); }).catch((err) => { scheduleMicro(() => { vmPromise.rejected = err; }); });
-            localStack.push(vmPromise);
+            localStack.push(spawnAsync(callee.fn, argc, callee.upvals, receiver));
           } else {
             for (let k = 0; k < argc; k++) localStack.push(args[k]);
             const rv = runFrameSync(callee.fn, argc, callee.upvals, receiver);
@@ -522,7 +535,7 @@ async function interpret(program, opts = {}) {
         case OP.RET: {
           const rv = localStack.pop();
           try { drainMicro(); } catch (e) { }
-          return rv;
+          return localFrame.yields || rv; // generators return their collected yields
         }
         case OP.CALL_HOST: {
           const nameIdx = a[0], argc = a[1];
@@ -608,8 +621,9 @@ async function interpret(program, opts = {}) {
   async function runFrameAsync(fnIdx, argc, upvals, thisObj) {
     const localFn = fns[fnIdx];
     const locals = mkCells(localFn.nlocals);
-    for (let k = argc - 1; k >= 0; k--) { const kv = stack.pop(); if (k < localFn.nparams) locals[k].v = kv; }
-    const localFrame = { idx: fnIdx, fn: localFn, i: 0, locals, upvals: upvals || [], thisObj: thisObj || null };
+    const __args = bindFrameArgs(localFn, locals, argc);
+    const localFrame = { idx: fnIdx, fn: localFn, i: 0, locals, upvals: upvals || [], thisObj: thisObj || null, args: __args };
+    if (localFn.generator) localFrame.yields = []; // collect yields; returned at RET
     const localStack = [];
     const localMaps = maps[fnIdx];
     const localHandlers = [];
@@ -713,9 +727,11 @@ async function interpret(program, opts = {}) {
           break;
         }
         case OP.LOAD_THIS: { localStack.push(localFrame.thisObj !== undefined ? localFrame.thisObj : null); break; }
+        case OP.LOAD_ARGS: { localStack.push(localFrame.args || []); break; }
+        case OP.YIELD: { const yv = localStack.pop(); if (localFrame.yields) localFrame.yields.push(yv); localStack.push(null); break; }
         case OP.RET: {
           const rv = localStack.pop();
-          return rv;
+          return localFrame.yields || rv; // generators return their collected yields
         }
         case OP.CALL_HOST: {
           const nameIdx = a[0], argc = a[1];
@@ -933,17 +949,10 @@ async function interpret(program, opts = {}) {
         const fnIdx = a[0], argc = a[1];
         const targetFn = fns[fnIdx];
         if (targetFn.async) {
-          const args = new Array(argc);
-          for (let k = argc - 1; k >= 0; k--) args[k] = stack.pop();
-          // push args back so runFrameAsync can pop them into the callee's locals
-          for (let k = 0; k < argc; k++) stack.push(args[k]);
-          const vmPromise = alloc(new VMObj()); vmPromise.__promise = true;
-          const jsP = runFrameAsync(fnIdx, argc, [], null);
-          vmPromise.jsPromise = jsP; pendingAsync.push(jsP);
-          jsP.then((res) => { scheduleMicro(() => { vmPromise.resolved = res; }); }).catch((err) => { scheduleMicro(() => { vmPromise.rejected = err; }); });
-          // add a VM-visible 'then' host closure so Promise.then works inside compiled code
-          vmPromise.set('then', { __closure: true, __host: 'promiseThen', __promiseRef: vmPromise });
-          stack.push(vmPromise);
+          // args are already on the stack; runFrameAsync pops them.
+          stack.push(spawnAsync(fnIdx, argc, [], null));
+        } else if (targetFn.generator) {
+          stack.push(runFrameSync(fnIdx, argc, [], null)); // returns collected yields
         } else {
           frame = makeFrame(fnIdx, argc, []);
         }
@@ -986,16 +995,11 @@ async function interpret(program, opts = {}) {
         } else {
         if (!isClosure(callee)) throw new Error('value is not callable: ' + toStr(callee));
         for (let k = 0; k < argc; k++) stack.push(args[k]);
-        // support calling async closures: callee.fn points to function index
         const target = fns[callee.fn];
         if (target.async) {
-          // args were pushed back already; create a VM promise wrapper around runFrameAsync
-          const vmPromise = alloc(new VMObj()); vmPromise.__promise = true;
-          const jsP = runFrameAsync(callee.fn, argc, callee.upvals, null);
-          vmPromise.jsPromise = jsP; pendingAsync.push(jsP);
-          jsP.then((res) => { scheduleMicro(() => { vmPromise.resolved = res; }); }).catch((err) => { scheduleMicro(() => { vmPromise.rejected = err; }); });
-          vmPromise.set('then', { __closure: true, __host: 'promiseThen', __promiseRef: vmPromise });
-          stack.push(vmPromise);
+          stack.push(spawnAsync(callee.fn, argc, callee.upvals, null));
+        } else if (target.generator) {
+          stack.push(runFrameSync(callee.fn, argc, callee.upvals, null));
         } else {
           // args are already on the stack from the push above; makeFrame pops them.
           frame = makeFrame(callee.fn, argc, callee.upvals);
@@ -1007,6 +1011,8 @@ async function interpret(program, opts = {}) {
         stack.push(frame.thisObj !== undefined ? frame.thisObj : null);
         break;
       }
+      case OP.LOAD_ARGS: { stack.push(frame.args || []); break; }
+      case OP.YIELD: { const yv = stack.pop(); if (frame.yields) frame.yields.push(yv); stack.push(null); break; }
       case OP.CALL_METHOD: {
         const argc = a[0];
         const args = new Array(argc);
@@ -1023,12 +1029,10 @@ async function interpret(program, opts = {}) {
         const target = fns[callee.fn];
         if (target.async) {
           for (let k = 0; k < argc; k++) stack.push(args[k]);
-          const vmPromise = alloc(new VMObj()); vmPromise.__promise = true;
-          const jsP = runFrameAsync(callee.fn, argc, callee.upvals, receiver);
-          vmPromise.jsPromise = jsP; pendingAsync.push(jsP);
-          jsP.then((res) => { scheduleMicro(() => { vmPromise.resolved = res; }); }).catch((err) => { scheduleMicro(() => { vmPromise.rejected = err; }); });
-          vmPromise.set('then', { __closure: true, __host: 'promiseThen', __promiseRef: vmPromise });
-          stack.push(vmPromise);
+          stack.push(spawnAsync(callee.fn, argc, callee.upvals, receiver));
+        } else if (target.generator) {
+          for (let k = 0; k < argc; k++) stack.push(args[k]);
+          stack.push(runFrameSync(callee.fn, argc, callee.upvals, receiver));
         } else {
           for (let k = 0; k < argc; k++) stack.push(args[k]);
           frame = makeFrame(callee.fn, argc, callee.upvals);

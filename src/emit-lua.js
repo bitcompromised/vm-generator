@@ -259,13 +259,15 @@ local function load()
     local upvals = { n = nUp }
     for uu = 0, nUp - 1 do local fl = u8(); local ui = u16(); upvals[uu] = { fromLocal = (fl == 1), index = ui } end
     local protLevel = u8()
+    local restParam = u8() -- 0xff = none
+    local fnFlags = u8()   -- bit0 = generator
     local codeLen = u32()
     local enc = { len = codeLen }
     for i = 0, codeLen - 1 do enc[i] = body[p + i] end
     p = p + codeLen
     for i = 0, codeLen - 1 do fnAll[fnAll.len + i] = enc[i] end
     fnAll.len = fnAll.len + codeLen
-    fns[f] = { name = name, nparams = nparams, nlocals = nlocals, upvals = upvals, code = decRounds(enc, codeSeed, f, protLevel) }
+    fns[f] = { name = name, nparams = nparams, nlocals = nlocals, upvals = upvals, restParam = (restParam ~= 255 and restParam or nil), generator = (fnFlags % 2 == 1), async = (math.floor(fnFlags / 2) % 2 == 1), code = decRounds(enc, codeSeed, f, protLevel) }
   end
   -- independent domain: functions
   if fnv1a(fnAll) ~= dFn then error('integrity check failed: function domain') end
@@ -350,6 +352,7 @@ local function host(name, args)
   elseif name == 'rand' then return math.random()
   elseif name == 'time' then return os.time() * 1000
   elseif name == 'push' then local a = args[0]; a[a.n] = args[1]; a.n = a.n + 1; return a
+  elseif name == '__extend' then local a = args[0]; local it = args[1]; if isArr(it) then for i = 0, it.n - 1 do a[a.n] = it[i]; a.n = a.n + 1 end end; return a
   elseif name == 'keys' then local a = args[0]; if isObj(a) then local arr = newArr(a.keys.n); for i = 1, a.keys.n do arr[i - 1] = a.keys[i] end; return arr else return newArr(0) end
   elseif name == 'has' then local a = args[0]; if isObj(a) then return objHas(a, args[1]) else return false end
   else error('unknown host builtin ' .. name) end
@@ -418,15 +421,21 @@ local function run(prog)
     elseif op == OP.JMP then ip = rd16()
     elseif op == OP.JZ then local addr = rd16(); if not truthy(pop()) then ip = addr end
     elseif op == OP.JNZ then local addr = rd16(); if truthy(pop()) then ip = addr end
+    elseif op == OP.LOAD_THIS then push(frame.thisObj ~= nil and frame.thisObj or NULL)
+    elseif op == OP.LOAD_ARGS then push(frame.args ~= nil and frame.args or newArr(0))
+    elseif op == OP.YIELD then local yv = pop(); if frame.yields ~= nil then frame.yields[frame.yields.n] = yv; frame.yields.n = frame.yields.n + 1 end; push(NULL)
     elseif op == OP.CALL then
       local fnIdx = rd16(); local argc = rd8()
       if MAX_DEPTH > 0 and fp + 1 > MAX_DEPTH then error('resource limit: call depth exceeded') end
       local callee = fns[fnIdx]
       local locals = mkCells(callee.nlocals)
-      for k = argc - 1, 0, -1 do locals[k].v = pop() end
+      local av = {}; for k = argc - 1, 0, -1 do av[k] = pop() end
+      local argsArr = newArr(argc); for k = 0, argc - 1 do argsArr[k] = av[k] end
+      for k = 0, callee.nparams - 1 do if k < argc then locals[k].v = av[k] end end
+      if callee.restParam ~= nil then local r = newArr(0); local ri = 0; for k = callee.restParam, argc - 1 do r[ri] = av[k]; ri = ri + 1 end; r.n = ri; locals[callee.restParam].v = r end
       frame.ip = ip
       fp = fp + 1; frames[fp] = frame
-      frame = { code = callee.code, ip = 0, locals = locals, upvals = {} }
+      frame = { code = callee.code, ip = 0, locals = locals, upvals = {}, args = argsArr }
       code = frame.code; ip = 0
     elseif op == OP.CALL_VALUE then
       local vargc = rd8()
@@ -479,6 +488,11 @@ local function run(prog)
     elseif op == OP.END_TRY then handlers[hp] = nil; hp = hp - 1
     elseif op == OP.THROW then local tv = pop(); if not raise(tv) then error('uncaught exception: ' .. toStr(tv)) end
     elseif op == OP.PRINT then print(toStr(pop()))
+    -- superinstructions (combined opcodes)
+    elseif op == OP.LOADADD then local b = frame.locals[rd16()].v; local a = pop(); if type(a) == 'number' and type(b) == 'number' then push(a + b) else push(toStr(a) .. toStr(b)) end
+    elseif op == OP.LOADSUB then local b = frame.locals[rd16()].v; push(pop() - b)
+    elseif op == OP.LOADLT then local b = frame.locals[rd16()].v; push(pop() < b)
+    elseif op == OP.CONSTADD then local b = consts[rd16()]; local a = pop(); if type(a) == 'number' and type(b) == 'number' then push(a + b) else push(toStr(a) .. toStr(b)) end
     else error('illegal opcode ' .. tostring(op)) end
   end
 end

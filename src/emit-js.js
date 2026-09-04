@@ -182,27 +182,39 @@ ${opConstBlock()}
       var upvals = [];
       for (var uu = 0; uu < nUp; uu++) { var fl = u8(); var ui = u16(); upvals.push({ fromLocal: fl === 1, index: ui }); }
       var protLevel = u8();
+      var restParam = u8(); // 0xff = none
+      var fnFlags = u8();   // bit0 = generator
       var codeLen = u32();
       var enc = body.slice(p, p + codeLen); p += codeLen;
       fnAll = fnAll.concat(enc);
-      fns.push({ name: name, nparams: nparams, nlocals: nlocals, upvals: upvals, code: decRounds(enc, codeSeed, f, protLevel) });
+      fns.push({ name: name, nparams: nparams, nlocals: nlocals, upvals: upvals, restParam: (restParam === 0xff ? null : restParam), generator: (fnFlags & 1) !== 0, async: (fnFlags & 2) !== 0, code: decRounds(enc, codeSeed, f, protLevel) });
     }
     // independent domain: functions.
     if (fnv1a(fnAll) !== dFn) throw new Error('integrity check failed: function domain');
     return { byte2canon: byte2canon, consts: consts, fns: fns };
   }
 
-  // ---- value model: number | string | boolean | null | Array | VMObj | closure | cell ----
-  function VMObj() { this.keys = []; this.map = {}; }
-  VMObj.prototype.get = function (k) { k = '' + k; return Object.prototype.hasOwnProperty.call(this.map, k) ? this.map[k] : null; };
-  VMObj.prototype.set = function (k, v) { k = '' + k; if (!Object.prototype.hasOwnProperty.call(this.map, k)) this.keys.push(k); this.map[k] = v; };
-  VMObj.prototype.has = function (k) { return Object.prototype.hasOwnProperty.call(this.map, '' + k); };
-  // Serialize as a plain object so JSON.stringify and native consumers see the
-  // logical key/value shape, not the VM's internal fields.
-  VMObj.prototype.toJSON = function () { var o = {}; for (var i = 0; i < this.keys.length; i++) o[this.keys[i]] = this.map[this.keys[i]]; return o; };
-  function isObj(v) { return v instanceof VMObj; }
+  // ---- value model: number | string | boolean | null | Array | VM object | closure | cell ----
+  // VM objects are REAL JS objects: user keys are own enumerable properties, so
+  // Object.keys / defineProperty / Proxy / Symbol keys all work natively. A
+  // WeakSet tags VM-created objects (for isObj + toStr formatting); class metadata
+  // lives in a WeakMap so it never appears as an enumerable property.
+  var __vmset = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;
+  var __vmeta = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+  function mkObj(proto) { var o = proto ? Object.create(proto) : {}; if (__vmset) __vmset.add(o); return o; }
+  function isObj(v) { return v !== null && typeof v === 'object' && !Array.isArray(v) && v.__closure !== true && __vmset && __vmset.has(v); }
+  function metaOf(o) { if (!__vmeta) return null; var m = __vmeta.get(o); if (!m) { m = {}; __vmeta.set(o, m); } return m; }
   function isClosure(v) { return !!v && typeof v === 'object' && v.__closure === true; }
   function mkCells(n) { var a = new Array(n); for (var i = 0; i < n; i++) a[i] = { v: null }; return a; }
+  function objKeys(o) { var r = []; for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) r.push(k); return r; }
+  // Build a call frame: bind params (extra args ignored), collect a rest param
+  // into an array, and stash the full argument list for LOAD_ARGS (arguments).
+  function mkFrame(fn, args, upvals, thisObj) {
+    var locals = mkCells(fn.nlocals), np = fn.nparams;
+    for (var k = 0; k < np; k++) locals[k].v = (k < args.length ? args[k] : null);
+    if (fn.restParam != null && fn.restParam >= 0) locals[fn.restParam].v = args.slice(fn.restParam);
+    return { fn: fn, ip: 0, locals: locals, upvals: upvals || [], thisObj: thisObj, args: args };
+  }
 
   function toStr(v) {
     if (v === null || v === undefined) return 'null';
@@ -210,18 +222,14 @@ ${opConstBlock()}
     if (v === false) return 'false';
     if (typeof v === 'number') return String(v);
     if (typeof v === 'string') return v;
-    if (isObj(v)) { var r = []; for (var i = 0; i < v.keys.length; i++) { var k = v.keys[i]; r.push(k + ': ' + toStr(v.map[k])); } return '{' + r.join(', ') + '}'; }
     if (isClosure(v)) return '<fn>';
     if (Array.isArray(v)) { var a = []; for (var j = 0; j < v.length; j++) a.push(toStr(v[j])); return '[' + a.join(', ') + ']'; }
+    if (isObj(v)) { var r = [], ks = objKeys(v); for (var i = 0; i < ks.length; i++) r.push(ks[i] + ': ' + toStr(v[ks[i]])); return '{' + r.join(', ') + '}'; }
     return String(v);
   }
   function truthy(v) { return !(v === null || v === undefined || v === false || v === 0 || v === ''); }
   function u32of(n) { return n >>> 0; }
   function idxGet(obj, key) {
-    if (isObj(obj)) {
-      if (obj.__getters && Object.prototype.hasOwnProperty.call(obj.__getters, key)) return __runMethod(obj.__getters[key], obj, []);
-      return obj.get(key);
-    }
     if (isClosure(obj)) {
       // Function.prototype.bind/call/apply on VM closures, bridged to real calls.
       if (key === 'bind') return function () { var t = arguments[0], b = Array.prototype.slice.call(arguments, 1); return function () { return __runMethod(obj, t, b.concat(Array.prototype.slice.call(arguments))); }; };
@@ -229,20 +237,45 @@ ${opConstBlock()}
       if (key === 'apply') return function () { return __runMethod(obj, arguments[0], arguments[1] || []); };
       return undefined;
     }
-    if (Array.isArray(obj)) return obj[key];
     if (typeof obj === 'string') { if (key === 'length') return obj.length; return obj[key]; }
     if (obj === null || obj === undefined) throw new Error('cannot index ' + toStr(obj));
-    return obj[key]; // native object / function / number
+    var r = obj[key]; // native property access: VM objects, arrays, class instances, host objects, getters
+    if (r === undefined && isObj(obj) && !(key in obj)) return null; // VM objects read missing keys as null
+    return r;
   }
   function idxSet(obj, key, val) {
-    if (isObj(obj)) {
-      if (obj.__setters && Object.prototype.hasOwnProperty.call(obj.__setters, key)) { __runMethod(obj.__setters[key], obj, [val]); return; }
-      obj.set(key, val); return;
-    }
-    if (Array.isArray(obj)) { obj[key] = val; return; }
     if (obj && (typeof obj === 'object' || typeof obj === 'function')) { obj[key] = val; return; }
     throw new Error('cannot assign index of ' + toStr(obj));
   }
+
+  // Synchronous promise model. The VM dispatch loop is synchronous, so real
+  // microtasks cannot suspend it; instead Promise.resolve / .then / .catch /
+  // .finally and await are modelled as immediately-settled thenables that run
+  // callbacks in-line. Ordering is preserved because everything is sequential.
+  function syncSettled(state, value) {
+    var t = { __syncthen: true, state: state, value: value };
+    t.then = function (onF, onR) {
+      try {
+        if (t.state === 'fulfilled') return syncSettled('fulfilled', onF ? onF(t.value) : t.value);
+        if (onR) return syncSettled('fulfilled', onR(t.value));
+        return t;
+      } catch (e) { return syncSettled('rejected', e); }
+    };
+    t.catch = function (onR) { return t.then(undefined, onR); };
+    t.finally = function (fn) { if (fn) fn(); return t; };
+    return t;
+  }
+  function toSyncPromise(v) {
+    if (v && v.__syncthen) return v;
+    if (v && typeof v.then === 'function') { var got, err, ok = true; v.then(function (x) { got = x; }, function (e) { ok = false; err = e; }); return ok ? syncSettled('fulfilled', got) : syncSettled('rejected', err); }
+    return syncSettled('fulfilled', v);
+  }
+  var __SyncPromise = {
+    resolve: function (v) { return toSyncPromise(v); },
+    reject: function (e) { return syncSettled('rejected', e); },
+    all: function (arr) { var out = []; for (var i = 0; i < arr.length; i++) { var s = toSyncPromise(arr[i]); if (s.state === 'rejected') return s; out.push(s.value); } return syncSettled('fulfilled', out); },
+    race: function (arr) { return arr.length ? toSyncPromise(arr[0]) : syncSettled('fulfilled', undefined); },
+  };
 
   // Shared global environment + host globals (real JS built-ins by name).
   var __globals = Object.create(null);
@@ -273,22 +306,33 @@ ${opConstBlock()}
   }
   function __instanceof(o, c) {
     if (typeof c === 'function') { try { return o instanceof c; } catch (e) { return false; } }
-    if (isObj(c) && c.get('__isClass')) { var k = isObj(o) ? o.__classRef : null; while (k && isObj(k)) { if (k === c) return true; k = k.get('__super'); } return false; }
+    if (isObj(c) && c['__isClass']) { var k = isObj(o) ? metaOf(o).classRef : null; while (k && isObj(k)) { if (k === c) return true; k = k['__super']; } return false; }
     return false;
   }
   var __runMethod = null; // set inside run(): (closure, thisObj, args) -> result
+  var __runGeneratorFn = null; // set inside run(): (closure, thisObj) -> yielded array
   function __newObj(args) {
     var cls = args[0], rest = args.slice(1);
-    if (typeof cls === 'function') { try { for (var a = 0; a < rest.length; a++) rest[a] = toNativeJs(rest[a]); return new (Function.prototype.bind.apply(cls, [null].concat(rest)))(); } catch (e) { return null; } }
-    if (isObj(cls) && cls.get('__isClass')) {
-      var inst = new VMObj(); inst.__classRef = cls;
+    if (typeof cls === 'function') {
+      // new Proxy(target, handler): the handler's trap methods are VM closures;
+      // bridge them to native functions so the engine can invoke them.
+      if (typeof Proxy !== 'undefined' && cls === Proxy && rest.length === 2 && isObj(rest[1])) {
+        var h = rest[1], nh = {}, hk = objKeys(h);
+        for (var hi = 0; hi < hk.length; hi++) { var hv = h[hk[hi]]; nh[hk[hi]] = isClosure(hv) ? toNativeJs(hv) : hv; }
+        rest[1] = nh;
+      }
+      try { for (var a = 0; a < rest.length; a++) rest[a] = toNativeJs(rest[a]); return new (Function.prototype.bind.apply(cls, [null].concat(rest)))(); } catch (e) { return null; }
+    }
+    if (isObj(cls) && cls['__isClass']) {
       var chain = [], c = cls;
-      while (c && isObj(c) && c.get('__isClass')) { chain.unshift(c); c = c.get('__super'); }
-      // copy methods (base first so derived overrides win)
-      for (var i = 0; i < chain.length; i++) { var m = chain[i].get('__methods'); if (isObj(m)) for (var j = 0; j < m.keys.length; j++) inst.set(m.keys[j], m.map[m.keys[j]]); }
-      // run the nearest constructor with this = inst
+      while (c && isObj(c) && c['__isClass']) { chain.unshift(c); c = c['__super']; }
+      // methods live on a (non-enumerable) prototype so Object.keys(instance) shows only fields
+      var proto = {};
+      for (var i = 0; i < chain.length; i++) { var m = chain[i]['__methods']; if (isObj(m)) { var mk = objKeys(m); for (var j = 0; j < mk.length; j++) proto[mk[j]] = m[mk[j]]; } }
+      var inst = mkObj(proto);
+      metaOf(inst).classRef = cls;
       var ctor = null;
-      for (var ci = chain.length - 1; ci >= 0; ci--) { var cc = chain[ci].get('__ctor'); if (cc) { ctor = cc; break; } }
+      for (var ci = chain.length - 1; ci >= 0; ci--) { if (chain[ci]['__ctor']) { ctor = chain[ci]['__ctor']; break; } }
       if (ctor && isClosure(ctor) && __runMethod) __runMethod(ctor, inst, rest);
       return inst;
     }
@@ -297,7 +341,7 @@ ${opConstBlock()}
 
   function host(name, args) {
     switch (name) {
-      case 'len': return Array.isArray(args[0]) ? args[0].length : (isObj(args[0]) ? args[0].keys.length : String(args[0]).length);
+      case 'len': return Array.isArray(args[0]) ? args[0].length : (isObj(args[0]) ? objKeys(args[0]).length : String(args[0]).length);
       case 'str': return toStr(args[0]);
       case 'num': return parseFloat(args[0]);
       case 'floor': return Math.floor(args[0]);
@@ -305,13 +349,23 @@ ${opConstBlock()}
       case 'rand': return Math.random();
       case 'time': return Date.now();
       case 'push': args[0].push(args[1]); return args[0];
-      case 'keys': return isObj(args[0]) ? args[0].keys.slice() : (args[0] && typeof args[0] === 'object' ? Object.keys(args[0]) : []);
-      case 'has': return isObj(args[0]) ? args[0].has(args[1]) : false;
+      case '__extend': {
+        var a = args[0], it = args[1];
+        var symIt = (it && typeof Symbol !== 'undefined') ? it[Symbol.iterator] : undefined;
+        if (Array.isArray(it) || typeof it === 'string') { for (var ei = 0; ei < it.length; ei++) a.push(it[ei]); }
+        else if (isClosure(symIt) && __runGeneratorFn) { var seq = __runGeneratorFn(symIt, it); for (var gi = 0; gi < seq.length; gi++) a.push(seq[gi]); } // VM generator [Symbol.iterator]()
+        else if (typeof symIt === 'function') { var iter = symIt.call(it), st; while (!(st = iter.next()).done) a.push(st.value); }
+        else if (isObj(it)) { var ks = objKeys(it); for (var ki = 0; ki < ks.length; ki++) a.push(it[ks[ki]]); }
+        return a;
+      }
+      case 'keys': return (args[0] && typeof args[0] === 'object') ? objKeys(args[0]) : [];
+      case 'has': return (args[0] && typeof args[0] === 'object') ? (('' + args[1]) in args[0]) : false;
       case '__setglobal': __globals[args[0]] = args[1]; return args[1];
       case '__getglobal': {
         var nm = args[0];
         if (Object.prototype.hasOwnProperty.call(__globals, nm)) return __globals[nm];
         if (nm === 'require') return __requireBridge;
+        if (nm === 'Promise') return __SyncPromise; // synchronous promise model
         if (Object.prototype.hasOwnProperty.call(__hostg, nm)) return __hostg[nm];
         return undefined;
       }
@@ -319,10 +373,21 @@ ${opConstBlock()}
       case 'bitnot': return ~(Number(args[0]) || 0);
       case 'pow': return Math.pow(args[0], args[1]);
       case 'instanceof': return __instanceof(args[0], args[1]);
-      case 'inop': { var k = args[0], o = args[1]; if (isObj(o)) return o.has(k); if (Array.isArray(o)) return Number(k) >= 0 && Number(k) < o.length; if (o && typeof o === 'object') return k in o; return false; }
+      case 'inop': { var k = args[0], o = args[1]; if (Array.isArray(o)) return Number(k) >= 0 && Number(k) < o.length; if (o && typeof o === 'object') return (('' + k) in o); return false; }
       case 'require': return __requireBridge(args[0]);
       case '__new': return __newObj(args);
-      case '__defaccessor': { var o = args[0]; if (isObj(o)) { if (args[2] === 'get') { (o.__getters || (o.__getters = {}))[args[1]] = args[3]; } else { (o.__setters || (o.__setters = {}))[args[1]] = args[3]; } } return o; }
+      case '__defaccessor': {
+        var o = args[0], name = args[1], kind = args[2], fn = args[3];
+        if (o && typeof o === 'object') {
+          var d = Object.getOwnPropertyDescriptor(o, name);
+          var desc = { enumerable: true, configurable: true };
+          if (d && d.get) desc.get = d.get; if (d && d.set) desc.set = d.set;
+          if (kind === 'get') desc.get = (function (f) { return function () { return __runMethod(f, this, []); }; })(fn);
+          else desc.set = (function (f) { return function (v) { __runMethod(f, this, [v]); }; })(fn);
+          try { Object.defineProperty(o, name, desc); } catch (e) {}
+        }
+        return o;
+      }
       case '__regex': { try { return new RegExp(args[0], args[1] || ''); } catch (e) { return null; } }
       default: throw new Error('unknown host builtin ' + name);
     }
@@ -395,10 +460,12 @@ ${opConstBlock()}
             var fnIdx = rd16(), argc = rd8();
             if (MAX_DEPTH && frames.length + 1 > MAX_DEPTH) throw new Error('resource limit: call depth exceeded');
             var callee = fns[fnIdx];
-            var locals = mkCells(callee.nlocals);
-            for (var k = argc - 1; k >= 0; k--) { var kv = stack.pop(); if (k < callee.nparams) locals[k].v = kv; }
+            var cargs = new Array(argc);
+            for (var k = argc - 1; k >= 0; k--) cargs[k] = stack.pop();
+            if (callee.generator) { stack.push(runGenerator(callee, cargs, [], undefined)); break; }
+            if (callee.async) { stack.push(toSyncPromise(runClosure({ __closure: true, fn: fnIdx, upvals: [] }, cargs, undefined))); break; }
             frames.push(frame);
-            frame = { fn: callee, ip: 0, locals: locals, upvals: [] };
+            frame = mkFrame(callee, cargs, [], undefined);
             break;
           }
           case OP.CALL_VALUE: {
@@ -410,13 +477,15 @@ ${opConstBlock()}
             if (typeof vcallee === 'function' && !isClosure(vcallee)) { for (var vn=0;vn<vargs.length;vn++) vargs[vn]=toNativeJs(vargs[vn]); stack.push(vcallee.apply(null, vargs)); break; }
             if (!isClosure(vcallee)) throw new Error('value is not callable: ' + toStr(vcallee));
             var vfn = fns[vcallee.fn];
-            var vlocals = mkCells(vfn.nlocals);
-            for (var vk2 = 0; vk2 < vargc && vk2 < vfn.nparams; vk2++) vlocals[vk2].v = vargs[vk2];
+            if (vfn.generator) { stack.push(runGenerator(vfn, vargs, vcallee.upvals, undefined)); break; }
+            if (vfn.async) { stack.push(toSyncPromise(runClosure(vcallee, vargs, undefined))); break; }
             frames.push(frame);
-            frame = { fn: vfn, ip: 0, locals: vlocals, upvals: vcallee.upvals };
+            frame = mkFrame(vfn, vargs, vcallee.upvals, undefined);
             break;
           }
           case OP.LOAD_THIS: { stack.push(frame.thisObj !== undefined ? frame.thisObj : null); break; }
+          case OP.LOAD_ARGS: { stack.push(frame.args || []); break; }
+          case OP.YIELD: { var yv = stack.pop(); if (frame.yields) frame.yields.push(yv); stack.push(null); break; }
           case OP.CALL_METHOD: {
             var margc = rd8();
             var margs = new Array(margc);
@@ -426,13 +495,19 @@ ${opConstBlock()}
             if (typeof mcallee === 'function' && !isClosure(mcallee)) { for (var mn=0;mn<margs.length;mn++) margs[mn]=toNativeJs(margs[mn]); stack.push(mcallee.apply(mrecv, margs)); break; }
             if (!isClosure(mcallee)) throw new Error('value is not callable: ' + toStr(mcallee));
             var mfn = fns[mcallee.fn];
-            var mlocals = mkCells(mfn.nlocals);
-            for (var mk2 = 0; mk2 < margc && mk2 < mfn.nparams; mk2++) mlocals[mk2].v = margs[mk2];
+            if (mfn.generator) { stack.push(runGenerator(mfn, margs, mcallee.upvals, mrecv)); break; }
+            if (mfn.async) { stack.push(toSyncPromise(runClosure(mcallee, margs, mrecv))); break; }
             frames.push(frame);
-            frame = { fn: mfn, ip: 0, locals: mlocals, upvals: mcallee.upvals, thisObj: mrecv };
+            frame = mkFrame(mfn, margs, mcallee.upvals, mrecv);
             break;
           }
-          case OP.AWAIT: { stack.push(stack.pop()); break; } // synchronous VM: best-effort passthrough
+          case OP.AWAIT: {
+            var av = stack.pop();
+            if (av && av.__syncthen) { if (av.state === 'rejected') throw { __vmthrow: true, v: av.value }; stack.push(av.value); }
+            else if (av && (typeof av === 'object' || typeof av === 'function') && typeof av.then === 'function') { var sp = toSyncPromise(av); if (sp.state === 'rejected') throw { __vmthrow: true, v: sp.value }; stack.push(sp.value); }
+            else stack.push(av);
+            break;
+          }
           case OP.CLOSE_UPVALUE: { rd16(); break; } // locals are already heap cells
           case OP.LOADADD: { var laI = rd16(); var laX = stack.pop(), laB = frame.locals[laI].v; stack.push((typeof laX === 'number' && typeof laB === 'number') ? laX + laB : toStr(laX) + toStr(laB)); break; }
           case OP.LOADSUB: { var lsI = rd16(); stack.push(stack.pop() - frame.locals[lsI].v); break; }
@@ -472,8 +547,8 @@ ${opConstBlock()}
             var on = rd16(), pairs = [];
             for (var om = 0; om < on; om++) { var ov = stack.pop(), ok = stack.pop(); pairs.push([ok, ov]); }
             pairs.reverse();
-            var obj = new VMObj();
-            for (var pi = 0; pi < pairs.length; pi++) obj.set(pairs[pi][0], pairs[pi][1]);
+            var obj = mkObj();
+            for (var pi = 0; pi < pairs.length; pi++) { var pk = pairs[pi][0]; obj[typeof pk === 'symbol' ? pk : ('' + pk)] = pairs[pi][1]; }
             stack.push(obj);
             break;
           }
@@ -500,16 +575,26 @@ ${opConstBlock()}
     // An optional thisObj binds the receiver (used for methods / constructors).
     function runClosure(closure, args, thisObj) {
       var fn = fns[closure.fn];
-      var locals = mkCells(fn.nlocals);
-      for (var k = 0; k < args.length && k < fn.nparams; k++) locals[k].v = args[k];
       frames.push(frame);
       var rd = frames.length;
-      frame = { fn: fn, ip: 0, locals: locals, upvals: closure.upvals, thisObj: thisObj };
+      frame = mkFrame(fn, args, closure.upvals, thisObj);
       var rv = exec(rd);
       frame = frames.pop();
       return rv;
     }
     __runMethod = function (closure, thisObj, args) { return runClosure(closure, args, thisObj); };
+    // Run a generator function to completion, collecting all yielded values, and
+    // return them as an iterable array (finite generators; covers [...gen()]).
+    function runGenerator(fn, args, upvals, thisObj) {
+      frames.push(frame);
+      var rd = frames.length;
+      frame = mkFrame(fn, args, upvals, thisObj);
+      var yields = frame.yields = []; // a real array (spreads / iterates natively)
+      exec(rd);
+      frame = frames.pop();
+      return yields;
+    }
+    __runGeneratorFn = function (closure, thisObj) { return runGenerator(fns[closure.fn], [], closure.upvals, thisObj); };
     // Wrap a VM closure as a real JS callable so it can be handed to native host
     // methods (Array.map, Promise.then, ...).
     toNativeJs = function (v) {
@@ -528,7 +613,25 @@ ${opConstBlock()}
   }
 })();
 `;
-  return randomizeIdentifiers(src, opts);
+  return minifySource(randomizeIdentifiers(src, opts), opts);
+}
+
+// Lightweight, safe minification: strip full-line comments, blank lines and
+// leading indentation. Newlines are preserved (they double as statement
+// separators), and string/regex contents are never touched, so this cannot
+// merge or corrupt tokens. Disabled with opts.minify === false.
+function minifySource(src, opts) {
+  if (opts && opts.minify === false) return src;
+  const banner = [];
+  const out = [];
+  const lines = src.split('\n');
+  for (const raw of lines) {
+    const line = raw.replace(/^\s+/, '');
+    if (line === '') continue;
+    if (line.startsWith('//') || line.startsWith('--')) { if (out.length === 0) banner.push(raw); continue; }
+    out.push(line);
+  }
+  return banner.concat(out).join('\n') + '\n';
 }
 
 // ---- per-build polymorphism ----
@@ -540,7 +643,7 @@ ${opConstBlock()}
 const RANDOMIZABLE = [
   'guardStr', 'guardObj', 'objCount', 'mkCells', 'decodeB64', 'utf8', 'cipher', 'fnv1a',
   'keyedMac', 'strBytes', 'envKey', 'decRounds', 'roundSeed', 'fnSeed', 'ksByte', 'lcgNext',
-  'mul32', 'idxGet', 'idxSet', 'isObj', 'isClosure', 'truthy', 'toStr', 'VMObj', 'raise',
+  'mul32', 'idxGet', 'idxSet', 'isObj', 'isClosure', 'truthy', 'toStr', 'mkObj', 'objKeys', 'metaOf', 'raise',
   'runClosure', 'toNativeJs', 'exec', 'host', 'load', 'run', 'opConstBlock',
   'byte2canon', 'permBytes', 'domainBytes', 'constBlob', 'encConst', 'fnAll', 'sigBytes',
 ];

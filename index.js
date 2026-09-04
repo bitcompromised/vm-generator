@@ -18,3 +18,5 @@ module.exports = {
   emitJs, emitLua, interpret, optimize, benchmark,
   opcodes, version,
 };
+
+console.log(module.exports.opcodes.OPCODES);

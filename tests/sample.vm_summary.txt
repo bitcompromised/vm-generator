@@ -1,10 +1,226 @@
+vm-gen build summary
+================================================================
+
+## Configuration
+  target        js
+  profile       aggressive
+  format        2.0   protection v2
+  optimize      true
+  permute       randomized
+  fuse opcodes  true
+  conceal       true
+  dead-code     3 decoy function(s)
+  seeds/perm    derived (not stored in payload)
+  rename all    on
+  signed        false
+  limits        steps=200000000 depth=512 objects=5000000 string=33554432
+
+## Source (input)
+----------------------------------------------------------------
+function <@split>greet(name) {
+  const greeting = "Hello, " + name + "!"; // build message
+  return greeting;
+}
+<@bogus 10>
+function factoriala(n) {
+  let result = 1;
+  for (let i = 2; i <= n; i++) {
+    result = result * i;
+  }
+  return result;
+}
+<@virtualization max>
+function factorialb(n) {
+  let result = 1;
+  for (let i = 2; i <= n; i++) {
+    result = result * i;
+  }
+  return result;
+}
+
+const <@name testtwo>secret = "top-secret-token-44";
+var test = 5+7;
+test += 9;
+console.log( greet(<@encstr MuaHaHaHaHaHa hex>), factoriala(5), secret);
+
+## Symbol rename table (original -> obfuscated)
+----------------------------------------------------------------
+  $main                    -> _Vx6zwJ8l6Xy
+  greet                    -> _BHktYz6
+  factoriala               -> _p3cbKBs
+  factorialb               -> _dDUxmBY
+
+## Functions
+----------------------------------------------------------------
+#0  $main   (compiled as: _Vx6zwJ8l6Xy)
+    params 0 | locals 0 | level weak
+    scope: (none)
+    bytecode:
+         0  PUSH_CONST  0
+         2  PUSH_CONST  1
+         4  CALL_HOST  2, 2
+         7  POP
+         8  PUSH_CONST  0
+        10  PUSH_CONST  0
+        12  CALL_HOST  3, 1
+        15  CONSTADD  4
+        17  CALL_HOST  2, 2
+        20  POP
+        21  PUSH_CONST  5
+        23  CALL_HOST  3, 1
+        26  DUP
+        27  PUSH_CONST  6
+        29  ARR_GET
+        30  PUSH_CONST  7
+        32  PUSH_CONST  8
+        34  PUSH_CONST  9
+        36  PUSH_CONST  10
+        38  PUSH_CONST  9
+        40  PUSH_CONST  10
+        42  PUSH_CONST  9
+        44  PUSH_CONST  10
+        46  PUSH_CONST  9
+        48  PUSH_CONST  10
+        50  PUSH_CONST  9
+        52  PUSH_CONST  10
+        54  PUSH_CONST  9
+        56  CALL_METHOD  13
+        58  CALL  1, 1
+        61  CONSTADD  11
+        63  PUSH_CONST  12
+        65  CALL  2, 1
+        68  ADD
+        69  CONSTADD  11
+        71  CONSTADD  13
+        73  PRINT
+        74  PUSH_NULL
+        75  POP
+        76  HALT
+
+#1  greet   (compiled as: _BHktYz6)
+    params 1 | locals 2 | level weak
+    scope: [0] name (param), [1] greeting
+    bytecode:
+         0  PUSH_CONST  14
+         2  LOADADD  0
+         4  CONSTADD  15
+         6  STORE  1
+         8  LOAD  1
+        10  RET
+        11  PUSH_NULL
+        12  RET
+
+#2  factoriala   (compiled as: _p3cbKBs)
+    params 1 | locals 3 | level medium
+    scope: [0] n (param), [1] result, [2] i
+    obfuscation: bogus:2  (+2 instructions added by passes)
+    bytecode:
+         0  PUSH_CONST  16
+         2  STORE  1
+         4  PUSH_CONST  17
+         6  STORE  2
+         8  LOAD  2
+        10  LOAD  0
+        12  LTE
+        13  JZ  51
+        15  LOAD  1
+        17  LOAD  2
+        19  MUL
+        20  STORE  1
+        22  LOAD  2
+        24  CONSTADD  16
+        26  DUP
+        27  STORE  2
+        29  PUSH_CONST  16
+        31  SUB
+        32  POP
+        33  JMP  12
+        35  POP
+        36  LOAD  1
+        38  RET
+        39  PUSH_NULL
+        40  RET
+        41  DUP
+        42  PUSH_TRUE
+
+#3  factorialb   (compiled as: _dDUxmBY)
+    params 1 | locals 3 | level heavy
+    scope: [0] n (param), [1] result, [2] i
+    bytecode:
+         0  PUSH_CONST  16
+         2  STORE  1
+         4  PUSH_CONST  17
+         6  STORE  2
+         8  LOAD  2
+        10  LOAD  0
+        12  LTE
+        13  JZ  50
+        15  LOAD  1
+        17  LOAD  2
+        19  MUL
+        20  STORE  1
+        22  LOAD  2
+        24  CONSTADD  16
+        26  DUP
+        27  STORE  2
+        29  PUSH_CONST  16
+        31  SUB
+        32  POP
+        33  JMP  12
+        35  LOAD  1
+        37  RET
+        38  PUSH_NULL
+        39  RET
+
+## Constant pool
+----------------------------------------------------------------
+  [0] "test"
+  [1] 12
+  [2] "__setglobal"
+  [3] "__getglobal"
+  [4] 9
+  [5] "String"
+  [6] "fromCharCode"
+  [7] 77
+  [8] 117
+  [9] 97
+  [10] 72
+  [11] " "
+  [12] 5
+  [13] "top-secret-token-44"
+  [14] "Hello, "
+  [15] "!"
+  [16] 1
+  [17] 2
+
+## Code added by protection
+----------------------------------------------------------------
+  obfuscation passes   +-5 instructions (flat/bogus/split/close-upvalue)
+  decoy functions      3 inert "dud" function(s) appended to the datastream:
+                       - well-formed, permuted, RET-terminated bytecode
+                       - never referenced by any CALL/CLOSURE, so never run
+                       - covered by the function-integrity domain like real code
+  symbol renaming      4 names -> opaque randoms
+  VM randomization     internal VM identifiers randomized + minified per build
+
+## Statistics
+----------------------------------------------------------------
+  real functions      4
+  decoy functions     3
+  total instructions  99  (-5 added by obfuscation passes)
+  constants           18
+  image size          686 bytes
+  checksum            0xbb8c33c5  (+ 4 integrity domains)
+
+## Final emitted VM source (js)
+----------------------------------------------------------------
 // Generated by vm-gen -- standalone protected JavaScript VM.
 // Do not edit: the embedded image is integrity-checked at startup.
 'use strict';
 (function () {
-var IMAGE_B64 = "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";
+var IMAGE_B64 = "VkcCABMCAMUzjLvWBUVAdrdcbQyHse1yfDtPagn40DsSALQAAAB6PT5NJs4wuYJtBiaRnrRnIwGGzw31NXMQVV0igDwAiqGSipg2ZnzRl84+Br1kV/bXS99IeYEdOjrSqAH3FZ57LPoE04xFVvM5Q7lUIg2BZQozNW9shn6rZsgvcD8nuAEBS/tO8PX+zT2YPWqyj2Tlc5WqQXRRrNtu7fn8qiHzlNHIBdMgWZs6MuRTb2WnNhRVgT4KyK3fgqJfus5NTF47iHqGqomNuAUIlCOv7RcBMPfL4VMHAAxfVng2endKOGw2WHkAAAAAAf8AawAAABJ7Ob84Q7BGux/bn10Cb6wcLwmGkTSCUAp1OTCGYFUBjKLN1HjSFBtPeatf67cW0+zusdBbwYkbu2OmW2GZ85V3rZV2PesGv5tLgdwwxgao/rQQUMne3nffXgcWbITkgCYk1mxr32MHOvncCF9CSGt0WXo2AQIAAAH/ABIAAAAYbSzuWL/unQcTwhajfgdVkBwIX3AzY2JLQnMBAwAAAv8AOwAAADwwfV7mIyy0jCD5Wsl6DokZymk8YEBmGJTFmKWpfQGolCE2ZPyvCaHmRWk9R7jPBG3nh5jjocsY573ECF9kRFV4bUJZAQMAAAP/ADgAAACiBM4h7lcxRCzvetN78yp1TrV+trLlC1F77aVyg8f4U8wvfZd2lXIjffA8Yoj/vjC/iYFhDuh6+g52ZXJpZnlNYW5pZmVzdAEBAAAD/wAPAAAA+BLbkJTR0lll3chrCzrOD2RlY29kZVRlbGVtZXRyeQAFAAAC/wAbAAAArh3JlH6g7v9Pz9rOLocS+gfZy0TdiDoIsYQHCXNjcnViSGVhcAMHAAAB/wAaAAAAn+XuJqkpgnO0TGqy//C7f0zZjSV3/RkIbDQ=";
 var __REQUIRE_BASE__ = "C:\\Users\\eadan\\OneDrive\\Desktop\\Claude-Projects\\vm-gen\\tests";
-var SALT = 689692255;
+var SALT = 3137125199;
 var OP = {
 HALT: 0,
 PUSH_CONST: 1,

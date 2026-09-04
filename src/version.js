@@ -54,9 +54,14 @@ module.exports = {
 // (0 = unlimited). These are defaults; explicit CLI flags override them.
 // `maxObjects` caps live object/array allocations; `maxString` caps the length
 // of any single string produced by concatenation. Both 0 = unlimited.
+// Global protection floor applied to every function (per-function directives win
+// on top). `flatten` = control-flow flattening; `bogus` = bogus-CF intensity
+// (0..3); `split` = basic-block splitting; `protLevel` = cipher rounds per
+// function (0..3); `encStr` = string-literal reconstruction (none|str_arr|hex|
+// bytecode|random); `fuse` = superinstruction fusion.
 module.exports.PROFILE_CONFIG = {
-  development: { optimize: false, permute: false, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, maxObjects: 0, maxString: 0, arch: 'stack-switch' },
-  balanced: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 1024, maxObjects: 0, maxString: 0, arch: 'stack-switch' },
-  aggressive: { optimize: true, permute: true, conceal: true, dud: true, maxSteps: 200000000, maxDepth: 512, maxObjects: 5000000, maxString: 33554432, arch: 'stack-switch' },
-  performance: { optimize: true, permute: true, conceal: false, dud: false, maxSteps: 0, maxDepth: 0, maxObjects: 0, maxString: 0, arch: 'stack-switch' },
+  development:  { optimize: false, permute: false, conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 0, encStr: 'none',  maxSteps: 0,         maxDepth: 0,    maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
+  balanced:     { optimize: true,  permute: true,  conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 1, encStr: 'none',  maxSteps: 0,         maxDepth: 1024, maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
+  aggressive:   { optimize: true,  permute: true,  conceal: true,  dud: true,  fuse: true,  flatten: true,  bogus: 2, split: true,  protLevel: 2, encStr: 'random', maxSteps: 200000000, maxDepth: 512,  maxObjects: 5000000, maxString: 33554432, arch: 'stack-switch' },
+  performance:  { optimize: true,  permute: true,  conceal: false, dud: false, fuse: false, flatten: false, bogus: 0, split: false, protLevel: 1, encStr: 'none',  maxSteps: 0,         maxDepth: 0,    maxObjects: 0,       maxString: 0,        arch: 'stack-switch' },
 };

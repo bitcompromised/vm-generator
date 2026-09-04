@@ -6,7 +6,141 @@ const { buildImage } = require('./protect');
 const { emitJs } = require('./emit-js');
 const { emitLua } = require('./emit-lua');
 const { disassemble } = require('./disasm');
+const { OP_NAME } = require('./opcodes');
 const V = require('./version');
+
+// A detailed, human-readable build summary written to <out>_summary.txt: the raw
+// source, the symbol rename table, every function's scope (params/locals by
+// name), the obfuscation passes applied and how many instructions they added,
+// the post-protection disassembly, and overall statistics.
+function buildSummary(program, source, cfg, meta, renameMap, mods, finalSource) {
+  const L = [];
+  const rule = (c) => c.repeat(64);
+  L.push('vm-gen build summary'); L.push(rule('='));
+  L.push('');
+  L.push('## Configuration');
+  L.push(`  target        ${meta.target || 'js'}`);
+  L.push(`  profile       ${cfg.profile}`);
+  L.push(`  format        ${meta.major}.${meta.minor}   protection v${V.PROTECTION_VERSION}`);
+  L.push(`  optimize      ${cfg.optimize}`);
+  L.push(`  permute       ${(meta.flags & V.FLAG_IDENTPERM) ? 'identity (dev)' : 'randomized'}`);
+  L.push(`  flatten CF    ${!!cfg.flatten}`);
+  L.push(`  bogus CF      ${cfg.bogus ? 'level ' + cfg.bogus : 'off'}`);
+  L.push(`  split blocks  ${!!cfg.split}`);
+  L.push(`  cipher rounds ${cfg.protLevel != null ? cfg.protLevel : 1} per function`);
+  L.push(`  fuse opcodes  ${!!cfg.fuse}`);
+  L.push(`  conceal ints  ${cfg.conceal}`);
+  L.push(`  encrypt str   ${cfg.encStr && cfg.encStr !== 'none' ? cfg.encStr + ' (' + (meta.encStrCount || 0) + ' literals reconstructed at runtime)' : 'off'}`);
+  L.push(`  dead-code     ${meta.dudFns || 0} decoy function(s)`);
+  L.push(`  seeds/perm    derived (not stored in payload)`);
+  L.push(`  rename all    ${meta.renameSymbols ? 'on' : 'off'}`);
+  L.push(`  signed        ${meta.signed}`);
+  L.push(`  limits        steps=${cfg.maxSteps} depth=${cfg.maxDepth} objects=${cfg.maxObjects} string=${cfg.maxString}`);
+  L.push('');
+  L.push('## Source (input)'); L.push(rule('-'));
+  L.push(source.replace(/\s+$/, ''));
+  L.push('');
+  L.push('## Symbol rename table (original -> obfuscated)'); L.push(rule('-'));
+  const rk = Object.keys(renameMap);
+  if (rk.length === 0) L.push('  (renaming disabled)');
+  for (const orig of rk) L.push(`  ${String(orig).padEnd(24)} -> ${renameMap[orig]}`);
+  L.push('');
+  L.push('## Functions'); L.push(rule('-'));
+  program.functions.forEach((fn, i) => {
+    const m = mods[i] || { name: fn.name, level: 'L' + fn.protLevel, mods: [] };
+    L.push(`#${i}  ${m.name}   (compiled as: ${fn.name})`);
+    L.push(`    params ${fn.nparams} | locals ${fn.nlocals} | level ${m.level}${fn.async ? ' | async' : ''}`);
+    // scope: local variable names (slot -> source name)
+    const names = [];
+    for (let s = 0; s < fn.nlocals; s++) if (fn.localNames && fn.localNames[s] !== undefined) names.push(`[${s}] ${fn.localNames[s]}${s < fn.nparams ? ' (param)' : ''}`);
+    L.push(`    scope: ${names.length ? names.join(', ') : '(none)'}`);
+    if (fn.upvals && fn.upvals.length) L.push(`    upvalues: ${fn.upvals.map((u) => u.name).join(', ')}`);
+    const added = (fn.finalInstrCount || 0) - (fn.origInstrCount || 0);
+    if (m.mods && m.mods.length) L.push(`    obfuscation: ${m.mods.join(', ')}  (+${added} instructions added by passes)`);
+    // post-protection disassembly (offsets already resolved)
+    L.push('    bytecode:');
+    let off = 0;
+    for (const ins of fn.instrs) {
+      const args = ins.args && ins.args.length ? '  ' + ins.args.join(', ') : '';
+      L.push(`      ${String(off).padStart(4)}  ${OP_NAME[ins.op]}${args}`);
+      off += 1 + (ins.args ? ins.args.reduce((a, x) => a + (x > 255 || x < 0 ? 2 : 1), 0) : 0);
+    }
+    L.push('');
+  });
+  L.push('## Constant pool'); L.push(rule('-'));
+  program.consts.forEach((c, i) => L.push(`  [${i}] ${typeof c === 'string' ? JSON.stringify(c) : c}`));
+  L.push('');
+  L.push('## Code added by protection'); L.push(rule('-'));
+  const addedByPass = program.functions.reduce((a, f) => a + ((f.finalInstrCount || 0) - (f.origInstrCount || 0)), 0);
+  L.push(`  obfuscation passes   +${addedByPass} instructions (flat/bogus/split/close-upvalue)`);
+  if (meta.dudFns) {
+    L.push(`  decoy functions      ${meta.dudFns} inert "dud" function(s) appended to the datastream:`);
+    L.push('                       - well-formed, permuted, RET-terminated bytecode');
+    L.push('                       - never referenced by any CALL/CLOSURE, so never run');
+    L.push('                       - covered by the function-integrity domain like real code');
+  } else {
+    L.push('  decoy functions      0 (enable with --dud or the aggressive profile)');
+  }
+  L.push(`  symbol renaming      ${meta.renameCount || 0} names -> opaque randoms`);
+  L.push(`  VM randomization     internal VM identifiers randomized + minified per build`);
+  L.push('');
+  L.push('## Statistics'); L.push(rule('-'));
+  const totalInstr = program.functions.reduce((a, f) => a + f.instrs.length, 0);
+  L.push(`  real functions      ${meta.numFns - (meta.dudFns || 0)}`);
+  L.push(`  decoy functions     ${meta.dudFns || 0}`);
+  L.push(`  total instructions  ${totalInstr}  (${addedByPass} added by obfuscation passes)`);
+  L.push(`  constants           ${program.consts.length}`);
+  L.push(`  image size          ${meta.imageSize} bytes`);
+  L.push(`  checksum            0x${meta.checksum.toString(16)}  (+ 4 integrity domains)`);
+  L.push('');
+  if (finalSource) {
+    L.push('## Final emitted VM source (' + (meta.target || 'js') + ')'); L.push(rule('-'));
+    L.push(finalSource.replace(/\s+$/, ''));
+    L.push('');
+  }
+  return L.join('\n');
+}
+
+// Rename every compiled function and upvalue to an opaque random identifier, so
+// the protected image never leaks original symbol names. Compiled calls use
+// numeric indices, and (in cells mode) upvalues use slot indices, so renaming is
+// purely cosmetic to the runtime -- but it strips a major analysis aid. `$main`
+// is left recognizable only internally; its stored name is randomized too.
+function randIdent(rng) {
+  const A = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let s = '_' + A[rng() % 52];
+  const n = 6 + (rng() % 6);
+  for (let i = 0; i < n; i++) s += (A + '0123456789')[rng() % 62];
+  return s;
+}
+function renameCompiledNames(program, rng) {
+  const renamed = {};
+  for (const fn of program.functions) {
+    const to = randIdent(rng);
+    renamed[fn.name] = to;
+    fn.name = to;
+    if (Array.isArray(fn.upvals)) for (const u of fn.upvals) if (u.name) u.name = randIdent(rng);
+    if (Array.isArray(fn.handlers)) for (const h of fn.handlers) if (h.catchName) h.catchName = randIdent(rng);
+  }
+  return renamed;
+}
+
+// Summarize per-function protection + modifications for the build console.
+function collectModifications(program) {
+  const LVL = ['native', 'weak', 'medium', 'heavy'];
+  const mods = [];
+  for (const fn of program.functions) {
+    const p = fn.prot || {};
+    const tags = [];
+    if (p.flatten) tags.push('flat');
+    if (p.bogus) tags.push('bogus:' + p.bogus);
+    if (p.split) tags.push('split');
+    if (p.deadcode) tags.push('deadcode:' + p.deadcode);
+    if (p.controlFlow) tags.push('controlflow:' + p.controlFlow);
+    mods.push({ name: fn.name, level: LVL[fn.protLevel] || ('L' + fn.protLevel), async: !!fn.async, mods: tags });
+  }
+  return mods;
+}
 
 // Resolve a build profile into a concrete configuration. Explicit options always
 // override the profile's defaults, so `--profile performance --max-depth 100`
@@ -27,15 +161,49 @@ function resolveConfig(options = {}) {
     maxDepth: pick('maxDepth'),
     maxObjects: pick('maxObjects'),
     maxString: pick('maxString'),
+    fuse: options.fuse !== undefined ? options.fuse : (base.fuse || false),
     arch: options.arch || base.arch,
+    // Global protection floor (applied to every function; directives win on top).
+    flatten: !!pick('flatten'),
+    bogus: (pick('bogus') | 0),
+    split: !!pick('split'),
+    protLevel: (pick('protLevel') != null ? (pick('protLevel') | 0) : 1),
+    encStr: pick('encStr') || 'none',
   };
 }
 
 function generate(source, options = {}) {
   const target = (options.target || 'js').toLowerCase();
   const cfg = resolveConfig(options);
-  const program = compile(source, { optimize: cfg.optimize, resolveImport: options.resolveImport });
+  // String reconstruction relies on JS host methods (String.fromCharCode /
+  // Array.join) that the Lua VM does not implement, so disable it for Lua. The
+  // constant-pool cipher (and optional conceal) still hides strings on both.
+  if ((target === 'lua') && cfg.encStr && cfg.encStr !== 'none') {
+    if (options.encStr && options.encStr !== 'none' && !options.quiet) {
+      console.error("vm-gen: note: --encstr is not supported for the lua target; ignoring (pool cipher still applies)");
+    }
+    cfg.encStr = 'none';
+  }
+  const globalProt = { flatten: cfg.flatten, bogus: cfg.bogus, split: cfg.split, protLevel: cfg.protLevel };
+  const program = compile(source, {
+    optimize: cfg.optimize, resolveImport: options.resolveImport, fuse: cfg.fuse, seed: options.seed,
+    globalProt, encStr: cfg.encStr,
+  });
   const limited = cfg.maxSteps > 0 || cfg.maxDepth > 0 || cfg.maxObjects > 0 || cfg.maxString > 0;
+
+  // Per-function modification report (before names are randomized so it reads).
+  const modifications = collectModifications(program);
+  // Rename all compiled symbols by default (disable only in development, or via
+  // renameSymbols:false). Uses a seeded RNG so builds stay reproducible.
+  const renameSymbols = options.renameSymbols !== undefined ? options.renameSymbols : (cfg.profile !== 'development');
+  let renameCount = 0;
+  let renameMap = {};
+  if (renameSymbols) {
+    let s = (options.seed !== undefined ? options.seed : 0x1234567) >>> 0; s = (s ^ 0xabcdef) >>> 0;
+    const rng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
+    renameMap = renameCompiledNames(program, rng);
+    renameCount = program.functions.length;
+  }
 
   const { image, meta } = buildImage(program, {
     seed: options.seed,
@@ -56,6 +224,13 @@ function generate(source, options = {}) {
   else if (target === 'lua') out = emitLua(image, emitOpts);
   else throw new Error(`Unknown target '${target}' (expected js or lua)`);
 
+  meta.modifications = modifications;
+  meta.renameSymbols = renameSymbols;
+  meta.renameCount = renameCount;
+  meta.target = target;
+  meta.cfg = cfg;                       // effective settings (for the build report)
+  meta.encStrCount = program.encStrCount || 0;
+  meta.summary = buildSummary(program, source, cfg, meta, renameMap, modifications, out);
   return { output: out, program, image, meta, config: cfg };
 }
 

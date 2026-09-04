@@ -125,12 +125,13 @@ function encodeFunction(fn, perm) {
 function serializeConsts(consts, conceal, rng) {
   const blob = [];
   for (const c of consts) {
-    if (conceal && typeof c === 'number' && Number.isInteger(c) && c >= 0 && c < 0x80000000) {
+    if (conceal && typeof c === 'number' && Number.isInteger(c) && c >= 0 && c < 0x80000000 && !Object.is(c, -0)) {
       const A = rng() >>> 0;
       const B = (c ^ A) >>> 0;
       w8(blob, 2); w32(blob, A); w32(blob, B);
     } else if (typeof c === 'number') {
-      const s = Buffer.from(String(c), 'utf8');
+      // preserve -0 (String(-0) === "0"); parseFloat("-0") reconstructs it.
+      const s = Buffer.from(Object.is(c, -0) ? '-0' : String(c), 'utf8');
       w8(blob, 0); w16(blob, s.length);
       for (const b of s) blob.push(b);
     } else {
@@ -231,7 +232,7 @@ function buildImage(program, options = {}) {
     // levels apply more cipher rounds. Default 1 preserves the historical scheme.
     const level = (fn.protLevel != null) ? fn.protLevel : 1;
     const enc = encRounds(plain, codeSeed, idx, level);
-    return { name: fn.name, nparams: fn.nparams, nlocals: fn.nlocals, upvals: fn.upvals || [], protLevel: level, enc };
+    return { name: fn.name, nparams: fn.nparams, nlocals: fn.nlocals, upvals: fn.upvals || [], protLevel: level, restParam: (fn.restParam != null ? fn.restParam : 0xff), fnFlags: (fn.generator ? 1 : 0) | (fn.async ? 2 : 0), enc };
   });
 
   // Dud-code injection: append decoy functions to the datastream. They are
@@ -267,6 +268,8 @@ function buildImage(program, options = {}) {
     w8(body, f.upvals.length);
     for (const u of f.upvals) { w8(body, u.fromLocal ? 1 : 0); w16(body, u.index); }
     w8(body, f.protLevel);
+    w8(body, f.restParam != null ? f.restParam : 0xff); // rest-param index, 0xff = none
+    w8(body, f.fnFlags || 0); // function flags: bit0 = generator
     w32(body, f.enc.length);
     for (const b of f.enc) body.push(b);
   }

@@ -17,8 +17,48 @@ const { OP, OP_OPERANDS } = require('./opcodes');
 const { parse } = require('./parser');
 const { optimize } = require('./optimize');
 const { expandImports, hasImports } = require('./modules');
+const { applyTransforms } = require('./transforms');
 
 const HOST_BUILTINS = new Set(['len', 'str', 'num', 'floor', 'abs', 'rand', 'time', 'push', 'keys', 'has', 'handlers', 'await', 'createProto']);
+
+// Global string-literal encryption: rewrite every non-empty string literal used
+// as a value expression into an equivalent expression that reconstructs it at
+// runtime, so the plaintext never appears in the constant pool. Semantics are
+// preserved (the expression evaluates to the identical string). `mode` is one of
+// str_arr | hex | bytecode | random; `random` picks per-string from a seeded RNG.
+function encStrExpr(str, mode, rng) {
+  if (mode === 'random') mode = ['str_arr', 'hex', 'bytecode'][rng() % 3];
+  if (mode === 'str_arr') {
+    const elements = Array.from(str).map((ch) => ({ type: 'Str', value: ch, _enc: true }));
+    return { type: 'Call', callee: { type: 'Member', object: { type: 'Array', elements }, property: 'join' }, args: [{ type: 'Str', value: '', _enc: true }] };
+  }
+  const codes = Array.from(str).map((ch) => ({ type: 'Num', value: ch.charCodeAt(0) }));
+  return { type: 'Call', callee: { type: 'Member', object: { type: 'Ident', name: 'String' }, property: 'fromCharCode' }, args: codes };
+}
+function encryptStrings(ast, mode, seed) {
+  if (!mode || mode === 'none') return ast;
+  let s = ((seed !== undefined ? seed : 0x9e3779b9) ^ 0x5bd1e995) >>> 0;
+  const rng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
+  let count = 0;
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return node;
+    if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) node[i] = walk(node[i]); return node; }
+    // Replace a bare string literal (that we did not already synthesize) in place.
+    if (node.type === 'Str' && !node._enc && typeof node.value === 'string' && node.value.length > 0) {
+      count++;
+      return encStrExpr(node.value, mode, rng);
+    }
+    for (const k of Object.keys(node)) {
+      if (k === 'type') continue;
+      const v = node[k];
+      if (v && typeof v === 'object') node[k] = walk(v);
+    }
+    return node;
+  };
+  walk(ast);
+  ast._encStrCount = count;
+  return ast;
+}
 
 function operandBytes(canonOp) {
   let n = 1;
@@ -43,6 +83,8 @@ class FnEmitter {
     this.upvalMap = new Map();
     // exception handler descriptors for this function (label refs resolved later)
     this.handlers = [];
+    // slot -> declared source name (persists across scope pops, for build reports)
+    this.localNames = {};
     for (const pnam of params) this.declare(pnam);
   }
   pushScope() { this.scopes.push(new Map()); }
@@ -50,6 +92,7 @@ class FnEmitter {
   declare(name) {
     const slot = this.nextSlot++;
     this.scopes[this.scopes.length - 1].set(name, slot);
+    this.localNames[slot] = name;
     return slot;
   }
   resolveLocal(name) {
@@ -135,10 +178,17 @@ class Compiler {
     this.hostIndex = new Map();
     this.fuse = opts.fuse === true; // superinstruction fusion (instruction-set polymorphism)
     this.useEnvObjects = opts.useEnvObjects === true; // capture upvalues into explicit env objects
+    // Global protection floor applied to EVERY function (per-function <@...>
+    // directives merge on top and win). Shape: { flatten, bogus, split, protLevel }.
+    this.globalProt = opts.globalProt || null;
+    // Deterministic RNG for the obfuscation transforms (seeded so builds repeat).
+    let s = ((opts.seed !== undefined ? opts.seed : 0x2545f491) ^ 0x6b43a9b5) >>> 0;
+    this.transformRng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
   }
 
   constId(value) {
-    const key = (typeof value) + ':' + String(value);
+    // Distinguish -0 from 0 (String(-0) === "0" would otherwise dedupe them).
+    const key = (typeof value) + ':' + (Object.is(value, -0) ? '-0' : String(value));
     if (this.constKey.has(key)) return this.constKey.get(key);
     const id = this.consts.length;
     this.consts.push(value);
@@ -183,6 +233,9 @@ class Compiler {
     for (const { idx, stmt } of topFns) {
       const fe = new FnEmitter(stmt.name, stmt.params, this, null);
       fe.protLevel = stmt.protLevel; // selective-virtualization annotation (may be undefined)
+      fe.prot = stmt.prot;           // per-pass modification knobs (flat/bogus/split/...)
+      fe.restParam = stmt.restParam;
+      fe.generator = !!stmt.generator;
       fe.async = !!stmt.async;
       this.compileBlock(fe, stmt.body, /*ownScope*/ false);
       fe.emit(OP.PUSH_NULL); // implicit "return null" fallthrough
@@ -205,6 +258,9 @@ class Compiler {
     this.functions.push(null); // reserve the slot before compiling the body
     const fe = new FnEmitter(node.name || '$anon', node.params, this, parentFe);
     fe.protLevel = node.protLevel; // selective-virtualization annotation (may be undefined)
+    fe.prot = node.prot;           // per-pass modification knobs (flat/bogus/split/...)
+    fe.restParam = node.restParam;
+    fe.generator = !!node.generator;
     fe.async = !!node.async;
     this.compileBlock(fe, node.body, /*ownScope*/ false);
     fe.emit(OP.PUSH_NULL);
@@ -216,6 +272,7 @@ class Compiler {
   // Resolve labels to absolute byte offsets and freeze the function.
   finishFn(fe) {
     let instrs = fe.instrs;
+    const origInstrCount = instrs.length; // before CLOSE_UPVALUE + obfuscation passes
 
     // Inject CLOSE_UPVALUE before each RET for any local slots captured by
     // upvalues. Inserting instructions shifts indices, so jump-target labels
@@ -241,6 +298,18 @@ class Compiler {
         }
       }
       instrs = newInstrs;
+    }
+
+    // Phase-4 control-flow obfuscation (per-function, driven by <@bogus>/<@split>).
+    // Semantics-preserving: only bogus/reordered structure is added. Runs on the
+    // {pos}-labelled instruction array before offsets are resolved.
+    // Merge the global protection floor with any per-function directive (the
+    // directive wins on conflict), so `--flatten-all` etc. reach every function.
+    let eprot = fe.prot;
+    if (this.globalProt) eprot = Object.assign({}, this.globalProt, fe.prot || {});
+    fe.prot = eprot; // reflect effective settings in the build report
+    if (eprot && (eprot.bogus || eprot.split || eprot.flatten)) {
+      instrs = applyTransforms(instrs, eprot, this.transformRng);
     }
 
     // Optional superinstruction fusion. Done here, before offsets are computed,
@@ -275,8 +344,17 @@ class Compiler {
       upvals: fe.upvals.map((u) => ({ fromLocal: u.fromLocal, index: u.index, name: u.name })),
       // map handler label refs into concrete addresses and export metadata
       handlers: fe.handlers.map((h) => ({ addr: offsets[h.handlerLabel.pos], hasCatch: h.hasCatch, catchName: h.catchName, hasFinalizer: h.hasFinalizer })),
-      protLevel: (fe.protLevel != null) ? fe.protLevel : 1, // default: weak (1 cipher round)
+      // cipher rounds: explicit directive wins, else the global floor, else weak(1)
+      protLevel: (fe.protLevel != null) ? fe.protLevel
+        : (this.globalProt && this.globalProt.protLevel != null ? this.globalProt.protLevel : 1),
+      prot: fe.prot || null, // per-pass modification knobs (for build reporting)
+      restParam: (fe.restParam != null) ? fe.restParam : null,
+      generator: !!fe.generator,
       async: !!fe.async,
+      // build-report metadata (names + how much the obfuscation passes grew the code)
+      localNames: fe.localNames,
+      origInstrCount,
+      finalInstrCount: instrs.length,
     };
   }
 
@@ -455,7 +533,7 @@ class Compiler {
         // Nested function declaration -> a locally-bound closure. The name is
         // declared BEFORE compiling the body so the function can recurse.
         const slot = fe.declare(s.name);
-        this.compileFnExpr(fe, { type: 'FnExpr', name: s.name, params: s.params, body: s.body, async: s.async, generator: s.generator });
+        this.compileFnExpr(fe, { type: 'FnExpr', name: s.name, params: s.params, body: s.body, async: s.async, generator: s.generator, restParam: s.restParam, protLevel: s.protLevel, prot: s.prot, generator: s.generator });
         fe.emit(OP.STORE, slot);
         break;
       }
@@ -531,6 +609,7 @@ class Compiler {
       case 'Ident': {
         const r = fe.resolve(e.name);
         if (e.name === 'this') { fe.emit(OP.LOAD_THIS); break; }
+        if (e.name === 'arguments' && r.kind === 'none' && !fe.isMain) { fe.emit(OP.LOAD_ARGS); break; }
         if (r.kind === 'local') fe.emit(OP.LOAD, r.slot);
         else if (r.kind === 'upval') {
           if (this.useEnvObjects) fe.emit(OP.LOAD_UPVALUE, this.constId(e.name));
@@ -548,8 +627,21 @@ class Compiler {
       }
       case 'FnExpr': this.compileFnExpr(fe, e); break;
       case 'Array': {
-        for (const el of e.elements) this.compileExpr(fe, el);
-        fe.emit(OP.NEW_ARR, e.elements.length);
+        const hasSpread = e.elements.some((el) => el && el.type === 'Spread');
+        if (!hasSpread) {
+          for (const el of e.elements) this.compileExpr(fe, el);
+          fe.emit(OP.NEW_ARR, e.elements.length);
+          break;
+        }
+        // real spread: accumulate into a fresh array with push / __extend.
+        fe.emit(OP.NEW_ARR, 0);
+        for (const el of e.elements) {
+          if (!el) continue; // hole
+          fe.emit(OP.DUP);
+          if (el.type === 'Spread') { this.compileExpr(fe, el.arg); fe.emit(OP.CALL_HOST, this.hostId('__extend'), 2); }
+          else { this.compileExpr(fe, el); fe.emit(OP.CALL_HOST, this.hostId('push'), 2); }
+          fe.emit(OP.POP);
+        }
         break;
       }
       case 'Object': {
@@ -599,7 +691,7 @@ class Compiler {
       }
       case 'Super': fe.emit(OP.PUSH_NULL); break;      // best-effort placeholder
       case 'Spread': this.compileExpr(fe, e.arg); break; // best-effort: flattened to one value
-      case 'Yield': this.compileExpr(fe, e.arg); break;  // best-effort: no real suspension
+      case 'Yield': this.compileExpr(fe, e.arg); fe.emit(OP.YIELD); break; // append to the frame's yield list; leaves null
       case 'Index': {
         this.compileExpr(fe, e.object);
         this.compileExpr(fe, e.index);
@@ -798,8 +890,12 @@ function compile(src, opts = {}) {
   if (opts.resolveImport || hasImports(src)) src = expandImports(src, opts.resolveImport);
   let ast = parse(src);
   if (opts.optimize) ast = optimize(ast); // behavior-preserving AST optimization
-  const c = new Compiler({ fuse: opts.fuse, useEnvObjects: !!opts.useEnvObjects });
+  // Global string encryption runs AFTER optimization (so constant folding can't
+  // re-collapse the reconstructed literals) but before codegen.
+  if (opts.encStr && opts.encStr !== 'none') ast = encryptStrings(ast, opts.encStr, opts.seed);
+  const c = new Compiler({ fuse: opts.fuse, useEnvObjects: !!opts.useEnvObjects, seed: opts.seed, globalProt: opts.globalProt });
   const program = c.compileProgram(ast);
+  program.encStrCount = ast._encStrCount || 0;
   program.upvalueMode = c.useEnvObjects ? 'env' : 'cells';
   return program;
 }

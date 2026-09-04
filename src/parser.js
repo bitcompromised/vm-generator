@@ -179,6 +179,9 @@ function parse(src) {
         case 'heavy': prot.level = 3; break;
         case 'deadcode': prot.deadcode = lvl != null ? lvl : 2; break;
         case 'controlflow': prot.controlFlow = lvl != null ? lvl : 2; break;
+        case 'flat': prot.flatten = true; if (prot.level == null) prot.level = 2; break;   // control-flow flattening
+        case 'bogus': prot.bogus = lvl != null ? lvl : 2; if (prot.level == null) prot.level = 2; break; // opaque predicates / dead states
+        case 'split': prot.split = true; if (prot.level == null) prot.level = 2; break;    // basic-block splitting
         case 'sourcemap': prot.sourcemap = (d.args[0] || 'on').toLowerCase() !== 'off'; break;
         case 'name': prot.rename = d.args[0] || '*random*'; break;
         default: break;
@@ -217,6 +220,22 @@ function parse(src) {
     // bytecode / hex: reconstruct from character codes via String.fromCharCode.
     const codes = Array.from(str).map((ch) => ({ type: 'Num', value: ch.charCodeAt(0) }));
     return { type: 'Call', callee: { type: 'Member', object: { type: 'Ident', name: 'String' }, property: 'fromCharCode' }, args: codes };
+  }
+
+  // <@random max min> -> a runtime expression yielding a random integer in
+  // [min, max] (inclusive). Args are optional; defaults to [0, 1].
+  function randomNode(a, b) {
+    let max = a !== undefined ? Number(a) : 1;
+    let min = b !== undefined ? Number(b) : 0;
+    if (!isFinite(max)) max = 1; if (!isFinite(min)) min = 0;
+    if (min > max) { const t = min; min = max; max = t; }
+    const range = max - min + 1;
+    return {
+      type: 'Binary', op: '+',
+      left: { type: 'Call', callee: { type: 'Ident', name: 'floor' }, args: [
+        { type: 'Binary', op: '*', left: { type: 'Call', callee: { type: 'Ident', name: 'rand' }, args: [] }, right: { type: 'Num', value: range } }] },
+      right: { type: 'Num', value: min },
+    };
   }
 
   let renameCounter = 0;
@@ -400,7 +419,7 @@ function parse(src) {
   // into a plain name list plus a `prologue` of statements prepended to the body.
   function parseParamList() {
     eatOp('(');
-    const names = []; const prologue = []; const renames = {}; let k = 0;
+    const names = []; const prologue = []; const renames = {}; let k = 0; let restIndex = null;
     while (!atOp(')')) {
       // <@name x> / <@name> before a parameter renames it (random when default).
       let paramRename = null;
@@ -408,7 +427,7 @@ function parse(src) {
         const prot = directivesToProt(collectDirectives());
         if (prot.rename) paramRename = prot.rename === '*random*' ? randomName() : prot.rename;
       }
-      if (atOp('...')) { eatOp('...'); const rn = eatName(); const nm = paramRename || rn; names.push(nm); if (paramRename) renames[rn] = nm; break; }
+      if (atOp('...')) { eatOp('...'); const rn = eatName(); const nm = paramRename || rn; restIndex = names.length; names.push(nm); if (paramRename) renames[rn] = nm; break; }
       if (atOp('{') || atOp('[')) {
         const pattern = parsePattern();
         const syn = `__arg${k++}`; names.push(syn);
@@ -427,7 +446,7 @@ function parse(src) {
       if (atOp(',')) eatOp(','); else break;
     }
     eatOp(')');
-    return { names, prologue, renames };
+    return { names, prologue, renames, restIndex };
   }
 
   // Assemble a function body: prepend the param prologue and apply any scoped
@@ -454,9 +473,9 @@ function parse(src) {
       let computed = false, key;
       if (atOp('[')) { computed = true; eatOp('['); key = parseExpr(); eatOp(']'); }
       else key = eatName();
-      const { names, prologue, renames } = parseParamList();
+      const { names, prologue, renames, restIndex } = parseParamList();
       const block = parseBlock();
-      members.push({ kind, static: isStatic, computed, key, value: { type: 'FnExpr', name: null, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen } });
+      members.push({ kind, static: isStatic, computed, key, value: { type: 'FnExpr', name: null, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen, restParam: restIndex } });
     }
     eatOp('}');
     return members;
@@ -656,9 +675,9 @@ function parse(src) {
     if (at('directive')) { const prot = directivesToProt(collectDirectives()); if (prot.rename) declRename = prot.rename === '*random*' ? randomName() : prot.rename; }
     const name = eatName();
     if (declRename) renameReqs.push({ from: name, to: declRename });
-    const { names, prologue, renames } = parseParamList();
+    const { names, prologue, renames, restIndex } = parseParamList();
     const block = parseBlock();
-    return { type: 'FnDecl', name, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen };
+    return { type: 'FnDecl', name, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen, restParam: restIndex };
   }
 
   // Anonymous / named function expression: fn [name] (params) { body }.
@@ -672,9 +691,9 @@ function parse(src) {
     let name = null;
     if (atName()) name = eatName(); // optional name (self-reference)
     if (declRename && name) renameReqs.push({ from: name, to: declRename });
-    const { names, prologue, renames } = parseParamList();
+    const { names, prologue, renames, restIndex } = parseParamList();
     const block = parseBlock();
-    return { type: 'FnExpr', name, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen };
+    return { type: 'FnExpr', name, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen, restParam: restIndex };
   }
 
   function parseReturn() {
@@ -837,9 +856,9 @@ function parse(src) {
     return false;
   }
 
-  function arrowBody(prologue, isAsync, params, renames) {
+  function arrowBody(prologue, isAsync, params, renames, restIndex) {
     const block = atOp('{') ? parseBlock() : { type: 'Block', body: [{ type: 'Return', value: parseExpr() }] };
-    return { type: 'FnExpr', name: null, params, body: withPrologue(prologue, block, renames), async: isAsync, generator: false };
+    return { type: 'FnExpr', name: null, params, body: withPrologue(prologue, block, renames), async: isAsync, generator: false, restParam: restIndex };
   }
 
   // In an object literal, is the modifier word at the cursor actually the key?
@@ -853,6 +872,8 @@ function parse(src) {
     // other directives (e.g. <@name f>) attach to the following expression.
     if (at('directive')) {
       const ds = collectDirectives();
+      const rnd = ds.find((d) => d.name === 'random');
+      if (rnd) return randomNode(rnd.args[0], rnd.args[1]);
       const enc = ds.find((d) => d.name === 'encstr');
       if (enc) {
         // Two inline forms:
@@ -919,7 +940,7 @@ function parse(src) {
     if (t.type === 'async') {
       if (toks[p+1] && toks[p+1].type === 'op' && toks[p+1].value === '(') {
         const save = p; next(); // consume async
-        if (looksLikeArrowParen()) { const { names, prologue, renames } = parseParamList(); eatOp('=>'); return arrowBody(prologue, true, names, renames); }
+        if (looksLikeArrowParen()) { const { names, prologue, renames, restIndex } = parseParamList(); eatOp('=>'); return arrowBody(prologue, true, names, renames, restIndex); }
         p = save;
       }
       if (toks[p+1] && toks[p+1].type === 'ident' && toks[p+2] && toks[p+2].type === 'op' && toks[p+2].value === '=>') {
@@ -942,9 +963,9 @@ function parse(src) {
     }
     if (atOp('(')) {
       if (looksLikeArrowParen()) {
-        const { names, prologue, renames } = parseParamList();
+        const { names, prologue, renames, restIndex } = parseParamList();
         eatOp('=>');
-        return arrowBody(prologue, false, names, renames);
+        return arrowBody(prologue, false, names, renames, restIndex);
       }
       eatOp('('); const e = parseExpr(); eatOp(')'); return e;
     }
@@ -975,9 +996,9 @@ function parse(src) {
         else if (at('num')) key = String(next().value);
         else key = eatName();
         if (atOp('(')) { // method / getter / setter
-          const { names, prologue, renames } = parseParamList();
+          const { names, prologue, renames, restIndex } = parseParamList();
           const block = parseBlock();
-          const fn = { type: 'FnExpr', name: null, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen };
+          const fn = { type: 'FnExpr', name: null, params: names, body: withPrologue(prologue, block, renames), async: isAsync, generator: isGen, restParam: restIndex };
           props.push({ key, keyNode, computed, value: fn, kind: (kind === 'init' ? 'init' : kind) });
         } else if (kind === 'get' || kind === 'set') { // `get`/`set` used as an ordinary key
           if (atOp(':')) { eatOp(':'); props.push({ key: kind, value: parseExpr() }); }

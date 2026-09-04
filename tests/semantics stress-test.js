@@ -1,7 +1,7 @@
 "use strict";
 
 const tests = [];
-
+<@virtualization max><@bogus 10><@split>
 function test(name, fn) {
   tests.push({ name, fn });
 }
@@ -495,7 +495,7 @@ test("BigInt arithmetic", () => {
 // Run
 // ---------------------------------------------------------
 
-async function main() {
+async function <@virtualization max><@split>main() {
   let passed = 0;
   let failed = 0;
 

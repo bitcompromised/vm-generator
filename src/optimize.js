@@ -113,7 +113,7 @@ function optExpr(e) {
       p.spread ? { spread: optExpr(p.spread) }
         : { key: p.key, kind: p.kind, computed: p.computed, keyNode: p.keyNode ? optExpr(p.keyNode) : undefined, value: optExpr(p.value) }
     )) };
-    case 'FnExpr': return { type: 'FnExpr', name: e.name, params: e.params, body: { type: 'Block', body: optBody(e.body.body, e.params) } };
+    case 'FnExpr': return { type: 'FnExpr', name: e.name, params: e.params, body: { type: 'Block', body: optBody(e.body.body, e.params) }, async: e.async, generator: e.generator, protLevel: e.protLevel, prot: e.prot, restParam: e.restParam };
     default: return e; // literals and identifiers pass through
   }
 }
@@ -175,7 +175,7 @@ function optStmt(s) {
       return [{ type: 'For', init, test, update, body: { type: 'Block', body: optSeq(s.body.body) } }];
     }
     case 'FnDecl':
-      return [{ type: 'FnDecl', name: s.name, params: s.params, body: { type: 'Block', body: optBody(s.body.body, s.params) } }];
+      return [{ type: 'FnDecl', name: s.name, params: s.params, body: { type: 'Block', body: optBody(s.body.body, s.params) }, async: s.async, generator: s.generator, protLevel: s.protLevel, prot: s.prot, restParam: s.restParam }];
     default: return [s];
   }
 }
@@ -204,6 +204,9 @@ function collectNames(stmts, decl, assigned) {
     // `(q = q + 1)` a postfix `q++` lowers to). Mark its target as assigned so it
     // is never mistaken for a write-once constant.
     if (e.type === 'Assign' && e.target && e.target.type === 'Ident') assigned[e.target.name] = true;
+    // `typeof x` must stay a runtime read: a `var x` declared later is hoisted and
+    // reads `undefined` there, so inlining its eventual value would be wrong.
+    if (e.type === 'Unary' && e.op === 'typeof' && e.arg && e.arg.type === 'Ident') assigned[e.arg.name] = true;
     for (const k of Object.keys(e)) {
       const v = e[k];
       if (Array.isArray(v)) v.forEach(visitExpr);
