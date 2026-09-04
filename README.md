@@ -97,11 +97,34 @@ let f = (<@name>a) => a * 2;                          // param `a` -> random nam
 |---|---|
 | `<@encstr str hex\|str_arr\|bytecode\|random>` | The string, reconstructed at runtime so the literal never appears in the pool. |
 | `<@encstr hex>"world"` | Prefix form — encodes the following string literal. |
+| `<@encstr hex>42` | Prefix form on a number — a runtime integer reconstruction. |
 | `<@random max min>` | A random integer in `[min, max]` at runtime. |
 
 ```js
 if (a == <@encstr dog bytecode>) return 1;   // -> String.fromCharCode(100,111,103)
 console.log(<@random 6 1>);                  // 1..6
+```
+
+### Code directives (expand to statements / expressions)
+
+| Directive | Expands to |
+|---|---|
+| `<@fn name(args){ body }>` / `<@function …>` | A function declaration. |
+| `<@call f(args)>` | A call (statement or value). |
+| `<@log ...msg>` / `<@warn ...msg>` | `console.log` / `console.warn` of the (space-separated) args. |
+| `<@if a b>` | `a ? b : null`. |
+| `<@exists v>` | `typeof v !== "undefined"`. |
+| `<@throw err>` | `throw err`. |
+| `<@quit>` | Exit the current function (ends the program at top level). |
+| `<@dudret v>` | A **decoy return** guarded by an opaque predicate — never taken. |
+
+Code directives may **nest**: `<@dudret <@encstr hex>"x">`, `<@log "sum" <@call f()>>`.
+
+```js
+<@fn add(a, b){ return a + b }>
+const r = <@call add(2, 3)>
+<@log "sum =" r>
+if (r > 100) { <@throw "too big"> }
 ```
 
 ---
@@ -143,7 +166,13 @@ where the constant-pool cipher and `conceal` still hide strings.
 - **Symbol renaming** — all compiled function/upvalue/catch names are renamed to
   opaque randoms by default.
 - **VM randomization** — the emitted VM's internal identifiers are randomized every
-  build, and the output is minified.
+  build, the output is minified, the dispatch handlers can be shuffled
+  (`--mutate-handlers`), and the loader takes a per-build form (`--loader-form`).
+- **VM architecture** (`--arch`, JS target) — the execution substrate can be a
+  `stack-switch` machine (default) or a **register-based** one (`register` /
+  `register-threaded` / `register-encrypted`): an indexed register file addressed
+  by a stack pointer, with the encrypted variant holding the pointer masked.
+  Behaviour is identical; only the machine model differs.
 - **Multi-domain integrity** — independent checksums over header, dispatch table,
   constants, functions, plus a master checksum; tamper is localized and detected.
 - **Decoy functions** — inert, well-formed "dud" functions padded into the image.
