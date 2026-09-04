@@ -53,7 +53,8 @@ Options:
   --split, --no-split                    Basic-block splitting on all functions
   --prot-level   <0-3>                   Cipher rounds per function (default 1)
   --encstr       <mode>                  Encrypt string literals: none | str_arr |
-                                         hex | bytecode | random
+                                         hex | bytecode | random | tree
+                                         (tree = shared-blob substring extrapolation)
   --enc-num                              Encrypt integer literals (XOR reconstruction)
   --conceal, --no-conceal                Store integers as unsolved XOR expressions
   --fuse, --no-fuse                      Superinstruction (opcode) fusion
@@ -162,7 +163,7 @@ async function interactiveBuild(initialFile) {
     s.flatten = !!c.flatten; s.bogus = c.bogus | 0; s.split = !!c.split;
     s.protLevel = c.protLevel != null ? c.protLevel : 1; s.encStr = c.encStr || 'none'; return true;
   };
-  const ENC_MODES = ['none', 'str_arr', 'hex', 'bytecode', 'random'];
+  const ENC_MODES = ['none', 'str_arr', 'hex', 'bytecode', 'random', 'tree'];
   // ordered list of editable keys -> menu rows
   const KEYS = ['file', 'out', 'target', 'profile', 'optimize', 'permute', 'conceal',
     'flatten', 'bogus', 'split', 'protLevel', 'encStr', 'fuse', 'dud',
@@ -363,7 +364,7 @@ async function main() {
     const idc = { vm: 0, nativejs: 0, client: 0 };
     for (const m of (meta.modifications || [])) idc[m.identity] = (idc[m.identity] || 0) + 1;
     line(`    functions    ${meta.numFns} real${meta.dudFns ? ' + ' + meta.dudFns + ' decoy' : ''}`);
-    line(`    identity     vm:${idc.vm || 0} nativejs:${idc.nativejs || 0} client:${idc.client || 0} deadcode:${meta.dudFns || 0}`);
+    line(`    identity     vm:${idc.vm || 0} nativejs:${idc.nativejs || 0} client:${idc.client || 0} deadcode:${(idc.deadcode || 0) + (meta.dudFns || 0)}`);
     line(`    protection   native:${lv.native || 0} weak:${lv.weak || 0} medium:${lv.medium || 0} heavy:${lv.heavy || 0}`);
     line(`    image        ${meta.imageSize} bytes`);
     line(`    checksum     0x${meta.checksum.toString(16)}  (+ ${meta.domains ? 4 : 1} integrity domains)`);

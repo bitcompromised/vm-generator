@@ -182,7 +182,7 @@ function collectModifications(program) {
     //   nativejs - <@native> annotated: emitted to run without virtualization
     //   client   - ordinary guest code, virtualized into bytecode
     //   deadcode - decoy/dud (added to the image, reported separately)
-    const identity = i === 0 ? 'vm' : (fn.protLevel === 0 ? 'nativejs' : 'client');
+    const identity = fn.isDecoy ? 'deadcode' : (i === 0 ? 'vm' : (fn.protLevel === 0 ? 'nativejs' : 'client'));
     mods.push({ name: fn.name, level: LVL[fn.protLevel] || ('L' + fn.protLevel), async: !!fn.async, mods: tags, identity });
   });
   return mods;
@@ -324,7 +324,7 @@ function analyze(source, options = {}) {
         if (nm === undefined) continue;
         (s < fn.nparams ? params : locals).push(nm);
       }
-      const identity = i === 0 ? 'vm' : (fn.protLevel === 0 ? 'nativejs' : 'client');
+      const identity = fn.isDecoy ? 'deadcode' : (i === 0 ? 'vm' : (fn.protLevel === 0 ? 'nativejs' : 'client'));
       return {
         index: i,
         name: fn.name === '$main' ? '(top-level)' : fn.name,

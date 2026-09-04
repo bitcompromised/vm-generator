@@ -32,8 +32,18 @@ function encStrExpr(str, mode, rng) {
     const elements = Array.from(str).map((ch) => ({ type: 'Str', value: ch, _enc: true }));
     return { type: 'Call', callee: { type: 'Member', object: { type: 'Array', elements }, property: 'join' }, args: [{ type: 'Str', value: '', _enc: true }] };
   }
-  const codes = Array.from(str).map((ch) => ({ type: 'Num', value: ch.charCodeAt(0) }));
-  return { type: 'Call', callee: { type: 'Member', object: { type: 'Ident', name: 'String' }, property: 'fromCharCode' }, args: codes };
+  // fromCharCode: chunk into <=200-arg calls joined by '+' -- a call's argument
+  // count is a u8, so a single fromCharCode(...) over a long string (or the
+  // tree-map blob) would overflow 255 args and corrupt the stack.
+  const chars = Array.from(str);
+  const CH = 200;
+  let expr = null;
+  for (let i = 0; i < chars.length; i += CH) {
+    const codes = chars.slice(i, i + CH).map((ch) => ({ type: 'Num', value: ch.charCodeAt(0), _enc: true }));
+    const call = { type: 'Call', callee: { type: 'Member', object: { type: 'Ident', name: 'String' }, property: 'fromCharCode' }, args: codes };
+    expr = expr ? { type: 'Binary', op: '+', left: expr, right: call } : call;
+  }
+  return expr || { type: 'Str', value: '', _enc: true };
 }
 // Reconstruct an integer literal at runtime as (A ^ B) so it never appears as a
 // plaintext constant. Only u32 integers are eligible; others are left as-is.
@@ -73,6 +83,56 @@ function encryptStrings(ast, mode, seed, encNum) {
   walk(ast);
   ast._encStrCount = count;
   ast._encNumCount = numCount;
+  return ast;
+}
+
+// Tree-map string extrapolation: instead of each string sitting in the constant
+// pool, all string literals are folded into ONE shared blob with substring
+// sharing (a string that already occurs inside the blob -- e.g. "ell" inside
+// "hello" -- reuses that region), and every literal becomes `__B.slice(off, end)`.
+// No complete original string appears as its own pooled constant, common
+// fragments are deduplicated, and the blob itself is stored encoded (never as
+// plaintext). Behaviour is preserved (each slice equals the original string).
+function treeMapStrings(ast, mode, seed) {
+  let s = ((seed !== undefined ? seed : 0x9e3779b9) ^ 0x27d4eb2f) >>> 0;
+  const rng = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s; };
+  // 1. collect every non-empty string literal
+  const strs = new Set();
+  const collect = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (const n of node) collect(n); return; }
+    if (node.type === 'Str' && !node._enc && typeof node.value === 'string' && node.value.length > 0) strs.add(node.value);
+    for (const k of Object.keys(node)) { if (k === 'type') continue; const v = node[k]; if (v && typeof v === 'object') collect(v); }
+  };
+  collect(ast);
+  if (strs.size === 0) { ast._treeCount = 0; return ast; }
+  // 2. build the shared blob, longest strings first so shorter ones can be reused
+  const arr = [...strs].sort((a, b) => b.length - a.length);
+  let blob = '';
+  const pos = {};
+  for (const str of arr) {
+    let at = blob.indexOf(str);
+    if (at < 0) { at = blob.length; blob += str; }
+    pos[str] = [at, at + str.length];
+  }
+  // 3. inject `let __B = <encoded blob>` at program top (a global, so nested
+  //    functions can reach it), then rewrite every string literal to a slice.
+  const blobNode = encStrExpr(blob, mode === 'tree' ? 'hex' : mode, rng); // blob never stored plaintext
+  const decl = { type: 'Let', name: '__B', value: blobNode };
+  let count = 0;
+  const rewrite = (node) => {
+    if (!node || typeof node !== 'object') return node;
+    if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) node[i] = rewrite(node[i]); return node; }
+    if (node.type === 'Str' && !node._enc && typeof node.value === 'string' && node.value.length > 0) {
+      const [a, b] = pos[node.value]; count++;
+      return { type: 'Call', callee: { type: 'Member', object: { type: 'Ident', name: '__B' }, property: 'slice' }, args: [{ type: 'Num', value: a, _enc: true }, { type: 'Num', value: b, _enc: true }] };
+    }
+    for (const k of Object.keys(node)) { if (k === 'type') continue; const v = node[k]; if (v && typeof v === 'object') node[k] = rewrite(node[k]); }
+    return node;
+  };
+  rewrite(ast);
+  if (ast.type === 'Program' && Array.isArray(ast.body)) ast.body.unshift(decl);
+  ast._treeCount = count;
   return ast;
 }
 
@@ -255,6 +315,7 @@ class Compiler {
       const fe = new FnEmitter(stmt.name, stmt.params, this, null);
       fe.globalIndex = idx;
       fe.parentIndex = 0; // top-level functions hang off the root ($main)
+      fe.isDecoy = !!stmt._decoy;    // <@decoy> synthesized dead function
       fe.protLevel = stmt.protLevel; // selective-virtualization annotation (may be undefined)
       fe.prot = stmt.prot;           // per-pass modification knobs (flat/bogus/split/...)
       fe.restParam = stmt.restParam;
@@ -387,6 +448,7 @@ class Compiler {
       async: !!fe.async,
       // build-report metadata (names + how much the obfuscation passes grew the code)
       localNames: fe.localNames,
+      isDecoy: !!fe.isDecoy, // <@decoy> synthesized dead function
       parent: (fe.parentIndex != null) ? fe.parentIndex : -1, // parent fn index (for scope/CFG map)
       origInstrCount,
       finalInstrCount: instrs.length,
@@ -927,12 +989,15 @@ function compile(src, opts = {}) {
   let ast = parse(src);
   if (opts.optimize) ast = optimize(ast); // behavior-preserving AST optimization
   // Global string encryption runs AFTER optimization (so constant folding can't
-  // re-collapse the reconstructed literals) but before codegen.
-  if ((opts.encStr && opts.encStr !== 'none') || opts.encNum) ast = encryptStrings(ast, opts.encStr, opts.seed, opts.encNum);
+  // re-collapse the reconstructed literals) but before codegen. `tree` mode uses
+  // the shared-blob extrapolation; other modes encrypt each literal in place.
+  if (opts.encStr === 'tree') ast = treeMapStrings(ast, 'tree', opts.seed);
+  if ((opts.encStr && opts.encStr !== 'none' && opts.encStr !== 'tree') || opts.encNum) ast = encryptStrings(ast, opts.encStr === 'tree' ? 'none' : opts.encStr, opts.seed, opts.encNum);
   const c = new Compiler({ fuse: opts.fuse, useEnvObjects: !!opts.useEnvObjects, seed: opts.seed, globalProt: opts.globalProt, perFnProt: opts.perFnProt });
   const program = c.compileProgram(ast);
-  program.encStrCount = ast._encStrCount || 0;
+  program.encStrCount = (ast._encStrCount || 0) + (ast._treeCount || 0);
   program.encNumCount = ast._encNumCount || 0;
+  program.treeCount = ast._treeCount || 0;
   program.upvalueMode = c.useEnvObjects ? 'env' : 'cells';
   return program;
 }

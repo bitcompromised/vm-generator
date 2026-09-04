@@ -282,7 +282,11 @@ ${opConstBlock()}
 
   // Shared global environment + host globals (real JS built-ins by name).
   var __globals = Object.create(null);
+  // CommonJS module/exports so top-level module.exports assignments have a real
+  // target object instead of assigning into null.
+  var __module = { exports: {} };
   var __hostg = {
+    module: __module, exports: __module.exports,
     undefined: undefined, NaN: NaN, Infinity: Infinity, globalThis: (typeof globalThis !== 'undefined' ? globalThis : undefined), console: console,
     Object: Object, Array: Array, Math: Math, JSON: JSON, Number: Number, String: String, Boolean: Boolean,
     Promise: Promise, Map: Map, Set: Set, WeakMap: (typeof WeakMap !== 'undefined' ? WeakMap : undefined), WeakSet: (typeof WeakSet !== 'undefined' ? WeakSet : undefined),

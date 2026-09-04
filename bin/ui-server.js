@@ -13,8 +13,8 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { generate, analyze } = require('../src/generate');
-const V = require('../src/version');
+const { generate, analyze } = require('C:/Users/eadan/OneDrive/Desktop/Claude-Projects/vm-gen/src/generate');
+const V = require('C:/Users/eadan/OneDrive/Desktop/Claude-Projects/vm-gen/src/version');
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -29,6 +29,7 @@ function readBody(req) {
 function toGenerateOptions(body) {
   const itp = body.interpreter || {};
   const child = body.child || {};
+  const lim = body.limits || {};
   const perFn = {};
   for (const k of Object.keys(body.perFn || {})) {
     const v = body.perFn[k];
@@ -64,6 +65,10 @@ function toGenerateOptions(body) {
     dudCount: typeof child.dudCount === 'number' ? child.dudCount : undefined,
     renameSymbols: child.renameSymbols !== false,
     prod: !!body.prod,
+    // runtime resource limits + optional signing
+    maxSteps: lim.maxSteps | 0, maxDepth: lim.maxDepth | 0,
+    maxObjects: lim.maxObjects | 0, maxString: lim.maxString | 0,
+    sign: (typeof body.sign === 'string' && body.sign) ? body.sign : undefined,
     // per-function overrides
     perFnProt: perFn,
   };
@@ -132,5 +137,5 @@ function serve(html, port, initialFile) {
   });
   return server;
 }
-serve(fs.readFileSync("./ui.html", 'utf8'), 1111)
+serve(fs.readFileSync("C:/Users/eadan/OneDrive/Desktop/Claude-Projects/vm-gen/bin/ui.html", 'utf8'), 1111)
 module.exports = { serve, toGenerateOptions };

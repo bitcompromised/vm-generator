@@ -152,12 +152,23 @@ function serializeConsts(consts, conceal, rng) {
 // ranges so the decoy does not stand out as obviously bogus.
 function makeDudBytes(perm, numCanon, nconsts, nlocals, rng) {
   const bytes = [];
-  const nIns = 4 + (rng() % 12);
+  const starts = [0];              // byte offsets of instruction boundaries (jump targets)
+  const nIns = 8 + (rng() % 20);   // larger decoys so they read like real functions
+  const JUMPS = [OP.JMP, OP.JZ, OP.JNZ];
   // Prefer opcodes whose operands index existing consts/locals so the decoy is
-  // internally consistent; fall back to any canonical op.
+  // internally consistent; ~1 in 4 instructions is a fake control-flow jump to a
+  // plausible in-code offset, so the decoy disassembles into branchy flow.
   for (let k = 0; k < nIns; k++) {
+    if (rng() % 4 === 0) {
+      const jop = JUMPS[rng() % JUMPS.length];
+      bytes.push(perm[jop]);
+      const tgt = starts[rng() % starts.length]; // a recorded boundary (usually a back-edge)
+      bytes.push(tgt & 0xff, (tgt >>> 8) & 0xff);
+      starts.push(bytes.length);
+      continue;
+    }
     const canon = rng() % numCanon;
-    if (canon === OP.RET || canon === OP.HALT) { k--; continue; } // keep terminators for the end
+    if (canon === OP.RET || canon === OP.HALT || canon === OP.JMP || canon === OP.JZ || canon === OP.JNZ) { k--; continue; }
     bytes.push(perm[canon]);
     const kinds = OP_OPERANDS[canon];
     for (const kind of kinds) {
@@ -167,6 +178,7 @@ function makeDudBytes(perm, numCanon, nconsts, nlocals, rng) {
       if (kind === 'u16') bytes.push(v & 0xff, (v >>> 8) & 0xff);
       else bytes.push(v & 0xff);
     }
+    starts.push(bytes.length);
   }
   bytes.push(perm[OP.PUSH_NULL]);
   bytes.push(perm[OP.RET]);

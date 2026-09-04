@@ -117,6 +117,7 @@ console.log(<@random 6 1>);                  // 1..6
 | `<@throw err>` | `throw err`. |
 | `<@quit>` | Exit the current function (ends the program at top level). |
 | `<@dudret v>` | A **decoy return** guarded by an opaque predicate — never taken. |
+| `<@decoy x>` | Spawn an inert **decoy function** of strength `x` (0–3), reported as `deadcode`. |
 
 Code directives may **nest**: `<@dudret <@encstr hex>"x">`, `<@log "sum" <@call f()>>`.
 

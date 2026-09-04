@@ -332,6 +332,7 @@ console.log('== wired corpus (tests/ + modules/) ==');
   };
   const corpora = [
     { label: 'tests', dir: path.join(__dirname, '..', 'tests') },
+    { label: 'modules', dir: path.join(__dirname, '..', 'modules') },
     { label: 'modules', dir: path.join(require('os').homedir(), 'OneDrive', 'Desktop', 'modules') },
     { label: 'modules', dir: 'C:/Users/eadan/OneDrive/Desktop/modules' },
   ];

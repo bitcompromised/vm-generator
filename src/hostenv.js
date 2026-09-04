@@ -10,7 +10,10 @@
 // Real host globals a program may reference by name. Everything here is standard
 // and safe to expose; unknown names resolve to undefined.
 function hostGlobalTable() {
+  // CommonJS module/exports so top-level `module.exports = ...` has a real target.
+  const mod = { exports: {} };
   return {
+    module: mod, exports: mod.exports,
     undefined: undefined, NaN: NaN, Infinity: Infinity,
     globalThis, console,
     Object, Array, Math, JSON, Number, String, Boolean,

@@ -145,7 +145,7 @@
         </div>
         <div class="row">
           <label>encrypt strings
-            <select id="c_encstr"><option>none</option><option>str_arr</option><option>hex</option><option>bytecode</option><option>random</option></select>
+            <select id="c_encstr"><option>none</option><option>str_arr</option><option>hex</option><option>bytecode</option><option>random</option><option>tree</option></select>
           </label>
           <label><input type="checkbox" id="c_encnum"> encrypt numbers</label>
           <label><input type="checkbox" id="c_dud"> decoy functions</label>
@@ -154,6 +154,22 @@
         <div class="row">
           <label><input type="checkbox" id="c_rename" checked> rename symbols</label>
           <label><input type="checkbox" id="c_optimize" checked> optimize</label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Runtime limits &amp; signing</legend>
+        <div class="hint">Resource caps enforced at runtime (0 = unlimited); a sign key gates the VM to <code>VMGEN_KEY</code>.</div>
+        <div class="row">
+          <label>max steps <input type="number" id="r_steps" min="0" value="0"></label>
+          <label>max depth <input type="number" id="r_depth" min="0" value="0"></label>
+        </div>
+        <div class="row">
+          <label>max objects <input type="number" id="r_objects" min="0" value="0"></label>
+          <label>max string <input type="number" id="r_string" min="0" value="0"></label>
+        </div>
+        <div class="row">
+          <label>sign key <input type="text" id="r_sign" placeholder="(none)"></label>
         </div>
       </fieldset>
     </div>
@@ -302,6 +318,9 @@ function collectBuildBody(){
     child:{ flatten:$('c_flatten').checked, split:$('c_split').checked, bogus:parseInt($('c_bogus').value,10),
       encStr:$('c_encstr').value, encNum:$('c_encnum').checked, dud:$('c_dud').checked, dudCount:parseInt($('c_dudcount').value,10),
       renameSymbols:$('c_rename').checked, optimize:$('c_optimize').checked },
+    limits:{ maxSteps:parseInt($('r_steps').value,10)||0, maxDepth:parseInt($('r_depth').value,10)||0,
+      maxObjects:parseInt($('r_objects').value,10)||0, maxString:parseInt($('r_string').value,10)||0 },
+    sign: $('r_sign').value.trim(),
     perFn: perFnPayload,
   };
 }

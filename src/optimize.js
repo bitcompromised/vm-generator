@@ -175,7 +175,7 @@ function optStmt(s) {
       return [{ type: 'For', init, test, update, body: { type: 'Block', body: optSeq(s.body.body) } }];
     }
     case 'FnDecl':
-      return [{ type: 'FnDecl', name: s.name, params: s.params, body: { type: 'Block', body: optBody(s.body.body, s.params) }, async: s.async, generator: s.generator, protLevel: s.protLevel, prot: s.prot, restParam: s.restParam }];
+      return [{ type: 'FnDecl', name: s.name, params: s.params, body: { type: 'Block', body: optBody(s.body.body, s.params) }, async: s.async, generator: s.generator, protLevel: s.protLevel, prot: s.prot, restParam: s.restParam, _decoy: s._decoy }];
     default: return [s];
   }
 }

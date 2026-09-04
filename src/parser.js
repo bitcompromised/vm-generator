@@ -22,7 +22,7 @@ const BINPREC = {
 const KEYWORD_BINOPS = new Set(['instanceof', 'in']);
 
 // Directives that expand to code (as opposed to protection annotations).
-const CODE_DIRECTIVES = new Set(['fn', 'function', 'call', 'dudret', 'if', 'exists', 'throw', 'quit', 'log', 'warn']);
+const CODE_DIRECTIVES = new Set(['fn', 'function', 'call', 'dudret', 'if', 'exists', 'throw', 'quit', 'log', 'warn', 'decoy']);
 
 // Temp-name counter is module-level so a recursive fragment parse (used to expand
 // code directives) continues the outer numbering instead of colliding at __d0.
@@ -417,6 +417,19 @@ function parse(src, parseOpts) {
       case 'throw': return fragStmts('throw (' + d.rest + ');')[0];                  // <@throw err>
       case 'quit': return { type: 'Return', value: { type: 'Null' } };              // <@quit>
       case 'dudret': return fragStmts('if (rand() < 0) { return (' + d.rest + '); }')[0]; // <@dudret v> dead return
+      case 'decoy': {                                                                // <@decoy x> (x = 0..3 strength)
+        const x = Math.max(0, Math.min(3, parseInt(d.args[0] || '1', 10) || 0));
+        const nm = randomName();
+        const k = 3 + x * 4, n = 100 + x * 371, m = 7 + x * 3;
+        // A plausible but never-referenced function (dead code = decoy). Strength
+        // scales its size and its cipher rounds (protLevel).
+        let inner = '';
+        for (let j = 0; j <= x; j++) inner += `    if (acc > ${n + j * 13}) { acc = (acc - ${m + j}) >>> 0; } else { acc = (acc * 33 + ${k + j}) >>> 0; }\n`;
+        const body = `function ${nm}(a, b) {\n  let acc = ((a | 0) ^ ${n}) >>> 0;\n  for (let i = 0; i < ${k}; i = i + 1) { acc = ((acc * 31 + (b | 0)) ^ (i << 2)) >>> 0;\n${inner}  }\n  return acc >>> 0;\n}`;
+        const fn = fragStmts(body)[0];
+        if (fn) { fn.protLevel = x; fn._decoy = true; }
+        return fn;
+      }
       case 'if': return stmt(fragExpr(ifExpr(d.rest)));
       case 'exists': return stmt(fragExpr(existsExpr(d.rest)));
       default: return null;

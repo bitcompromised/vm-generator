@@ -1,0 +1,3310 @@
+vm-gen build summary
+================================================================
+
+## Configuration
+  target        js
+  profile       balanced
+  architecture  stack-switch
+  format        2.0   protection v2
+  optimize      true
+  permute       randomized
+  flatten CF    false
+  bogus CF      off
+  split blocks  false
+  cipher rounds 1 per function
+  fuse opcodes  false
+  conceal ints  false
+  encrypt str   off
+  encrypt num   off
+  dead-code     0 decoy function(s)
+  seeds/perm    derived (not stored in payload)
+  rename all    on
+  signed        false
+  limits        steps=0 depth=1024 objects=0 string=0
+
+## Source (input)
+----------------------------------------------------------------
+// Balance
+//
+// Port of Commands/Balance.mjs from bitcompromised/mineflayer.
+//
+// The original ran `/balance` and then blocked on the client's own
+// `awaitMessage(/Balance:/)` helper. Nothing like that exists here, and the
+// sandbox has no synchronous access to the bot at all, so the wait is
+// rebuilt from the two things the sandbox does give you: an
+// api.on('message') listener and a promise a timeout can settle. Every
+// caller waiting for a balance is parked in `waiters` until either the
+// server answers or the timeout fires - so two overlapping requests never
+// deadlock each other, and a server that silently ignores /balance never
+// wedges the module.
+//
+// Commands:
+//
+//   /bal                      read the balance and report it
+//   /bal command <text>       the command to send (default /balance)
+//   /bal poll <x> <s|m|h>     log the balance on a timer
+//   /bal poll off             stop polling
+//   /bal timeout <x> <s|ms>   how long to wait for the server's answer
+//   /bal announce on|off      also say the balance in public chat
+//   /bal owner add|remove|list [name]
+//   /bal status | help
+
+// ---- defaults ------------------------------------------------------------
+//
+// Edit these before uploading. Every one can also be changed at runtime with
+// the commands above - though runtime changes live in the module's memory
+// and are gone the moment it is unloaded.
+
+const DEFAULTS = {
+  // Usernames allowed to run commands. Empty means anyone may.
+  owners: [],
+
+  // What the server wants.
+  command: '/balance',
+
+  // How long to wait for the server to answer before giving up.
+  timeout: 5000,
+
+  // Log the balance every N ms. 0 disables.
+  poll: 0,
+
+  // Reply in public chat as well as logging. Off by default - a bot that
+  // announces its balance to the server every time anyone asks is a bot that
+  // gets noticed.
+  announce: false,
+}
+
+// What the server's answer looks like. Not runtime-editable: a regex typed
+// into chat is a good way to lock yourself out of your own module.
+const BALANCE_PATTERN = /balance/i
+
+// ---- command plumbing ----------------------------------------------------
+//
+// Commands are '/'-prefixed, which changes how they have to reach the bot: a
+// '/' line typed in game goes to the server as a command, not into public
+// chat, so nobody's public message will ever carry one. Two channels do
+// work:
+//
+//   * a whisper - /msg <bot> /bal status - which arrives verbatim;
+//   * the panel's chat box, which hands what you type to loaded modules
+//     as '@panel'. A line matching a command this module declares below
+//     is handled here and is not passed on to the server, so it draws no
+//     "Unknown command" reply.
+
+const PREFIX = '/'
+const NAMES = ['bal', 'balance', 'money']
+const PANEL_SENDER = '@panel'
+
+// Shown next to this module's commands in the panel's chat box.
+const DESCRIPTION = "Read the bot's in-game balance."
+
+// Splits "/bal poll 5 m" into { sub: 'poll', args: ['5', 'm'], rest: '5 m' }.
+// `rest` keeps the original casing and spacing, which is what a text value
+// needs.
+function parseCommand(message) {
+  if (typeof message !== 'string') return null
+  const trimmed = message.trim()
+  if (!trimmed.startsWith(PREFIX)) return null
+
+  const head = /^(\S+)(?:\s+([\s\S]*))?$/.exec(trimmed.slice(PREFIX.length))
+  if (!head || !NAMES.includes(head[1].toLowerCase())) return null
+
+  const tail = (head[2] || '').trim()
+  if (!tail) return { sub: '', args: [], rest: '' }
+
+  const parts = /^(\S+)(?:\s+([\s\S]*))?$/.exec(tail)
+  const rest = (parts[2] || '').trim()
+  return { sub: parts[1].toLowerCase(), args: rest ? rest.split(/\s+/) : [], rest }
+}
+
+const DURATION_UNITS = { ms: 1, s: 1000, sec: 1000, m: 60000, min: 60000, h: 3600000, hr: 3600000 }
+
+// Accepts "5 m", "5m", or a bare number in `defaultUnit`.
+function parseDuration(args, defaultUnit) {
+  if (!args.length) return null
+  const match = /^(\d+(?:\.\d+)?)(ms|sec|min|hr|[smh])?$/i.exec(args.join(''))
+  if (!match) return null
+  const scale = DURATION_UNITS[(match[2] || defaultUnit).toLowerCase()]
+  if (!scale) return null
+  return Math.round(Number(match[1]) * scale)
+}
+
+function formatDuration(ms) {
+  if (ms >= 3600000 && ms % 3600000 === 0) return `${ms / 3600000}h`
+  if (ms >= 60000 && ms % 60000 === 0) return `${ms / 60000}m`
+  if (ms % 1000 === 0) return `${ms / 1000}s`
+  return `${ms}ms`
+}
+
+function onOff(args) {
+  const word = (args[0] || '').toLowerCase()
+  if (['on', 'true', 'yes', 'enable', 'enabled'].includes(word)) return true
+  if (['off', 'false', 'no', 'disable', 'disabled'].includes(word)) return false
+  return null
+}
+
+// ---- helpers -------------------------------------------------------------
+
+// Legacy section-sign colour codes survive in chat, item names and window
+// titles on the servers this targets. Strip them before matching text.
+function stripCodes(text) {
+  return String(text == null ? '' : text).replace(/§[0-9a-fk-or]/gi, '')
+}
+
+// Chat components arrive as plain data - prismarine-chat's toString() is a
+// prototype method and does not survive the sandbox boundary - so flatten
+// them by hand. Handles the raw component, the ChatMessage wrapper (whose
+// own `json` field does survive), and a JSON string.
+function plainText(node) {
+  if (node == null) return ''
+  if (typeof node === 'string') {
+    const trimmed = node.trim()
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return plainText(JSON.parse(trimmed))
+      } catch {
+        return stripCodes(node)
+      }
+    }
+    return stripCodes(node)
+  }
+  if (Array.isArray(node)) return node.map(plainText).join('')
+  if (typeof node !== 'object') return String(node)
+  if (node.json) return plainText(node.json)
+
+  let out = ''
+  if (typeof node.text === 'string') out += stripCodes(node.text)
+  if (typeof node[''] === 'string') out += stripCodes(node[''])
+  if (Array.isArray(node.with)) out += node.with.map(plainText).join(' ')
+  if (Array.isArray(node.extra)) out += node.extra.map(plainText).join('')
+  return out
+}
+
+// These servers write money as "1,250,000" and as "1.25B" interchangeably,
+// often in the same message. Accept both.
+const SUFFIXES = { k: 1e3, m: 1e6, b: 1e9, t: 1e12 }
+
+function parseMoney(text) {
+  const match = /(\d[\d,]*(?:\.\d+)?)\s*([kmbt])?/i.exec(String(text))
+  if (!match) return null
+  const amount = Number(match[1].replace(/,/g, ''))
+  if (!Number.isFinite(amount)) return null
+  const suffix = match[2] && SUFFIXES[match[2].toLowerCase()]
+  return suffix ? amount * suffix : amount
+}
+
+function formatMoney(amount) {
+  if (!Number.isFinite(amount)) return String(amount)
+  const units = [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']]
+  for (const [size, tag] of units) {
+    if (Math.abs(amount) >= size) return `${(amount / size).toFixed(2)}${tag}`
+  }
+  return String(Math.round(amount))
+}
+
+// ---- module --------------------------------------------------------------
+
+module.exports = {
+  name: 'Balance',
+
+  async onLoad(bot, api) {
+    this.selfName = await bot.username
+    this.settings = { ...DEFAULTS, owners: [...DEFAULTS.owners] }
+    this.waiters = []
+    this.lastBalance = null
+    this.pollTimer = null
+
+    // Settles every request currently waiting on a reply. Called from the
+    // message listener and from onUnload, so a pending read can never
+    // outlive the module.
+    this.settle = (value) => {
+      const waiting = this.waiters
+      this.waiters = []
+      for (const waiter of waiting) {
+        clearTimeout(waiter.timer)
+        waiter.resolve(value)
+      }
+    }
+
+    this.onMessage = (jsonMsg) => {
+      if (this.waiters.length === 0) return
+      const text = plainText(jsonMsg)
+      if (!BALANCE_PATTERN.test(text)) return
+
+      // Read the number that follows the word "balance" rather than the
+      // first number in the line - "Balance: $1,000" and "Your balance is
+      // 1,000" both have the amount after the label, but a prefixed rank or
+      // timestamp would otherwise win.
+      const after = text.split(BALANCE_PATTERN)[1]
+      const amount = parseMoney(after == null ? text : after)
+      if (amount == null) return
+
+      this.lastBalance = amount
+      this.settle(amount)
+    }
+
+    // Resolves to the balance, or null if the server never answered.
+    this.readBalance = () => new Promise((resolve) => {
+      const waiter = { resolve, timer: null }
+      waiter.timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((w) => w !== waiter)
+        resolve(null)
+      }, this.settings.timeout)
+      // Registered before the command goes out, or a server that answers
+      // inside the same tick would answer nobody.
+      this.waiters.push(waiter)
+      bot.chat(this.settings.command).catch((err) => {
+        api.log(`Could not send ${this.settings.command}: ${err.message}`)
+      })
+    })
+
+    this.report = async (reply, announce) => {
+      const balance = await this.readBalance()
+      if (balance == null) {
+        reply(`No answer to ${this.settings.command} within ${formatDuration(this.settings.timeout)}.`)
+        return null
+      }
+      reply(`Balance: ${formatMoney(balance)} (${balance})`)
+      if (announce && this.settings.announce) await bot.chat(`Balance: ${formatMoney(balance)}`)
+      return balance
+    }
+
+    this.reschedulePoll = () => {
+      clearInterval(this.pollTimer)
+      this.pollTimer = null
+      if (this.settings.poll > 0) {
+        this.pollTimer = setInterval(() => { this.report((text) => api.log(text), false) }, this.settings.poll)
+      }
+    }
+
+    this.handlers = {
+      now: {
+        usage: 'now',
+        help: 'Read the balance (same as bare /bal).',
+        run: (args, reply) => this.report(reply, true),
+      },
+      command: {
+        usage: 'command <text>',
+        help: 'The command to send to the server.',
+        run: (args, reply, rest) => {
+          if (!rest) return reply(`Command is ${this.settings.command}. Usage: /bal command </balance>`)
+          this.settings.command = rest
+          reply(`Will send ${this.settings.command}.`)
+        },
+      },
+      poll: {
+        usage: 'poll <x> <s|m|h> | poll off',
+        help: 'Log the balance on a timer.',
+        run: (args, reply) => {
+          if (onOff(args) === false) {
+            this.settings.poll = 0
+            this.reschedulePoll()
+            return reply('Polling off.')
+          }
+          const every = parseDuration(args, 's')
+          if (every == null) return reply('Usage: /bal poll <x> <s|m|h>  or  /bal poll off')
+          if (every < 5000) return reply('Refusing to poll faster than every 5s.')
+          this.settings.poll = every
+          this.reschedulePoll()
+          reply(`Polling every ${formatDuration(every)}.`)
+        },
+      },
+      timeout: {
+        usage: 'timeout <x> <s|ms>',
+        help: "How long to wait for the server's answer.",
+        run: (args, reply) => {
+          const value = parseDuration(args, 's')
+          if (value == null) return reply('Usage: /bal timeout <x> <s|ms>')
+          if (value < 250) return reply('Refusing a timeout under 250ms - no server answers that fast.')
+          this.settings.timeout = value
+          reply(`Timeout set to ${formatDuration(value)}.`)
+        },
+      },
+      announce: {
+        usage: 'announce on|off',
+        help: 'Also say the balance in public chat.',
+        run: (args, reply) => {
+          const value = onOff(args)
+          if (value == null) return reply(`Announce is ${this.settings.announce ? 'on' : 'off'}. Usage: /bal announce on|off`)
+          this.settings.announce = value
+          reply(`Announce ${value ? 'on' : 'off'}.`)
+        },
+      },
+      owner: {
+        usage: 'owner add|remove|list [name]',
+        help: 'Who may run these commands (empty list = anyone).',
+        run: (args, reply) => this.ownerCommand(args, reply),
+      },
+      status: {
+        usage: 'status',
+        help: 'Show current settings.',
+        run: (args, reply) => {
+          reply(`Balance: command ${this.settings.command} | timeout ${formatDuration(this.settings.timeout)} | poll ${this.settings.poll ? formatDuration(this.settings.poll) : 'off'} | announce ${this.settings.announce ? 'on' : 'off'} | last ${this.lastBalance == null ? 'unknown' : formatMoney(this.lastBalance)} | owners: ${this.settings.owners.length ? this.settings.owners.join(', ') : 'anyone'}`)
+        },
+      },
+      help: {
+        usage: 'help',
+        help: 'List these commands.',
+        run: (args, reply) => this.helpCommand(reply),
+      },
+    }
+
+
+    // Published to the panel, and read by the host after onLoad: the same
+    // table without the handlers. The chat box builds its completion list
+    // from this, and the bot uses it to tell a module command apart from a
+    // real server command - so there is one source of truth for both, and
+    // adding a subcommand above is all it takes to have it offered.
+    this.commands = [{
+      name: NAMES[0],
+      aliases: NAMES.slice(1),
+      usage: PREFIX + NAMES[0],
+      description: DESCRIPTION,
+      subcommands: Object.keys(this.handlers).map((name) => ({
+        name,
+        usage: PREFIX + NAMES[0] + ' ' + this.handlers[name].usage,
+        description: this.handlers[name].help,
+      })),
+    }]
+    this.ownerCommand = (args, reply) => {
+      const action = (args[0] || 'list').toLowerCase()
+      const name = args[1]
+      if (action === 'list') {
+        return reply(`Owners: ${this.settings.owners.length ? this.settings.owners.join(', ') : 'anyone'}`)
+      }
+      if (!name) return reply(`Usage: /${NAMES[0]} owner ${action} <name>`)
+      if (action === 'add') {
+        if (this.settings.owners.includes(name)) return reply(`${name} is already an owner.`)
+        this.settings.owners.push(name)
+        return reply(`Added owner ${name}. Only ${this.settings.owners.join(', ')} may run these commands now.`)
+      }
+      if (action === 'remove') {
+        const index = this.settings.owners.indexOf(name)
+        if (index === -1) return reply(`${name} is not an owner.`)
+        this.settings.owners.splice(index, 1)
+        return reply(this.settings.owners.length ? `Removed ${name}.` : `Removed ${name} - anyone may run these commands now.`)
+      }
+      return reply(`Usage: /${NAMES[0]} owner add|remove|list [name]`)
+    }
+
+    this.helpCommand = (reply) => {
+      reply(`/${NAMES[0]} - ${Object.keys(this.handlers).length} subcommands (aliases: ${NAMES.map((n) => PREFIX + n).join(', ')})`)
+      for (const entry of Object.values(this.handlers)) reply(`  ${PREFIX}${NAMES[0]} ${entry.usage} - ${entry.help}`)
+      reply(`  ${PREFIX}${NAMES[0]} - read the balance`)
+    }
+
+    this.allowed = (username) => {
+      if (username === PANEL_SENDER) return true
+      if (this.settings.owners.length === 0) return true
+      return this.settings.owners.includes(username)
+    }
+
+    this.dispatch = async (source, username, message) => {
+      // The bot's own public chat is never a command; a whisper from itself
+      // is, because that is how the panel can reach a module through the
+      // server.
+      if (!username || (source === 'chat' && username === this.selfName)) return
+
+      const parsed = parseCommand(message)
+      if (!parsed) return
+      if (!this.allowed(username)) return
+
+      const reply = (text) => {
+        api.log(text)
+        if (source === 'whisper' && username !== PANEL_SENDER && username !== this.selfName) {
+          bot.whisper(username, text).catch(() => {})
+        }
+      }
+
+      try {
+        if (!parsed.sub) return await this.report(reply, true)
+        const entry = this.handlers[parsed.sub]
+        if (!entry) {
+          reply(`Unknown subcommand "${parsed.sub}".`)
+          return this.helpCommand(reply)
+        }
+        await entry.run(parsed.args, reply, parsed.rest)
+      } catch (err) {
+        api.log(`Command failed: ${err.message}`)
+      }
+    }
+
+    this.onChat = (username, message) => this.dispatch('chat', username, message)
+    this.onWhisper = (username, message) => this.dispatch('whisper', username, message)
+
+    api.on('message', this.onMessage)
+    api.on('chat', this.onChat)
+    api.on('whisper', this.onWhisper)
+    this.reschedulePoll()
+
+    api.log(`Balance ready - ${PREFIX}${NAMES[0]} runs ${this.settings.command}. Try ${PREFIX}${NAMES[0]} help.`)
+  },
+
+  async onUnload(bot, api) {
+    clearInterval(this.pollTimer)
+    api.off('message', this.onMessage)
+    api.off('chat', this.onChat)
+    api.off('whisper', this.onWhisper)
+    // Anything still waiting would hang forever once the listener is gone.
+    this.settle?.(null)
+    api.log('Balance stopped.')
+  },
+}
+
+## Symbol rename table (original -> obfuscated)
+----------------------------------------------------------------
+  $main                    -> _Vx6zwJ8l6Xy
+  parseCommand             -> _BHktYz6
+  parseDuration            -> _p3cbKBs
+  formatDuration           -> _dDUxmBY
+  onOff                    -> _tTaFuJ8hoFw
+  stripCodes               -> _B9ShEpuLU
+  plainText                -> _vRGP45QlmVW
+  parseMoney               -> _r3ILE5cJaTI
+  formatMoney              -> _HZor6fqhe
+  $anon                    -> _T16rWJobW
+
+## Functions
+----------------------------------------------------------------
+#0  $main   <vm>   (compiled as: _Vx6zwJ8l6Xy)
+    identity vm | params 0 | locals 0 | level weak
+    scope: (none)
+    bytecode:
+         0  PUSH_CONST  0
+         2  PUSH_CONST  1
+         4  NEW_ARR  0
+         6  PUSH_CONST  2
+         8  PUSH_CONST  3
+        10  PUSH_CONST  4
+        12  PUSH_CONST  5
+        14  PUSH_CONST  6
+        16  PUSH_CONST  7
+        18  PUSH_CONST  8
+        20  PUSH_FALSE
+        21  NEW_OBJ  5
+        23  CALL_HOST  9, 2
+        26  POP
+        27  PUSH_CONST  10
+        29  PUSH_CONST  11
+        31  PUSH_CONST  12
+        33  CALL_HOST  13, 2
+        36  CALL_HOST  9, 2
+        39  POP
+        40  PUSH_CONST  14
+        42  PUSH_CONST  15
+        44  CALL_HOST  9, 2
+        47  POP
+        48  PUSH_CONST  16
+        50  PUSH_CONST  17
+        52  PUSH_CONST  11
+        54  PUSH_CONST  18
+        56  NEW_ARR  3
+        58  CALL_HOST  9, 2
+        61  POP
+        62  PUSH_CONST  19
+        64  PUSH_CONST  20
+        66  CALL_HOST  9, 2
+        69  POP
+        70  PUSH_CONST  21
+        72  PUSH_CONST  22
+        74  CALL_HOST  9, 2
+        77  POP
+        78  PUSH_CONST  23
+        80  PUSH_CONST  24
+        82  PUSH_CONST  25
+        84  PUSH_CONST  26
+        86  PUSH_CONST  27
+        88  PUSH_CONST  28
+        90  PUSH_CONST  27
+        92  PUSH_CONST  29
+        94  PUSH_CONST  30
+        96  PUSH_CONST  31
+        98  PUSH_CONST  30
+       100  PUSH_CONST  32
+       102  PUSH_CONST  33
+       104  PUSH_CONST  34
+       106  PUSH_CONST  33
+       108  NEW_OBJ  7
+       110  CALL_HOST  9, 2
+       113  POP
+       114  PUSH_CONST  35
+       116  PUSH_CONST  36
+       118  PUSH_CONST  27
+       120  PUSH_CONST  29
+       122  PUSH_CONST  37
+       124  PUSH_CONST  38
+       126  PUSH_CONST  39
+       128  PUSH_CONST  40
+       130  PUSH_CONST  41
+       132  NEW_OBJ  4
+       134  CALL_HOST  9, 2
+       137  POP
+       138  PUSH_CONST  42
+       140  CALL_HOST  43, 1
+       143  PUSH_CONST  44
+       145  PUSH_CONST  45
+       147  PUSH_CONST  46
+       149  PUSH_CONST  47
+       151  CLOSURE  9
+       153  PUSH_CONST  184
+       155  CLOSURE  39
+       157  NEW_OBJ  3
+       159  ARR_SET
+       160  POP
+       161  HALT
+
+#1  parseCommand   <client>   (compiled as: _BHktYz6)
+    identity client | params 1 | locals 6 | level weak
+    scope: [0] message (param), [1] trimmed, [2] head, [3] tail, [4] parts, [5] rest
+    bytecode:
+         0  LOAD  0
+         2  CALL_HOST  186, 1
+         5  PUSH_CONST  187
+         7  NEQ
+         8  JZ  16
+        10  PUSH_NULL
+        11  RET
+        12  LOAD  0
+        14  DUP
+        15  PUSH_CONST  188
+        17  ARR_GET
+        18  CALL_METHOD  0
+        20  STORE  1
+        22  LOAD  1
+        24  DUP
+        25  PUSH_CONST  189
+        27  ARR_GET
+        28  PUSH_CONST  14
+        30  CALL_HOST  43, 1
+        33  CALL_METHOD  1
+        35  NOT
+        36  JZ  52
+        38  PUSH_NULL
+        39  RET
+        40  PUSH_CONST  190
+        42  PUSH_CONST  72
+        44  CALL_HOST  13, 2
+        47  DUP
+        48  PUSH_CONST  191
+        50  ARR_GET
+        51  LOAD  1
+        53  DUP
+        54  PUSH_CONST  137
+        56  ARR_GET
+        57  PUSH_CONST  14
+        59  CALL_HOST  43, 1
+        62  PUSH_CONST  61
+        64  ARR_GET
+        65  CALL_METHOD  1
+        67  CALL_METHOD  1
+        69  STORE  2
+        71  LOAD  2
+        73  NOT
+        74  JNZ  136
+        76  PUSH_CONST  16
+        78  CALL_HOST  43, 1
+        81  DUP
+        82  PUSH_CONST  151
+        84  ARR_GET
+        85  LOAD  2
+        87  PUSH_CONST  25
+        89  ARR_GET
+        90  DUP
+        91  PUSH_CONST  145
+        93  ARR_GET
+        94  CALL_METHOD  0
+        96  CALL_METHOD  1
+        98  NOT
+        99  JNZ  136
+       101  PUSH_FALSE
+       102  JMP  137
+       104  PUSH_TRUE
+       105  JZ  142
+       107  PUSH_NULL
+       108  RET
+       109  LOAD  2
+       111  PUSH_CONST  192
+       113  ARR_GET
+       114  JNZ  162
+       116  PUSH_CONST  72
+       118  JNZ  162
+       120  PUSH_FALSE
+       121  JMP  163
+       123  PUSH_TRUE
+       124  DUP
+       125  PUSH_CONST  188
+       127  ARR_GET
+       128  CALL_METHOD  0
+       130  STORE  3
+       132  LOAD  3
+       134  NOT
+       135  JZ  202
+       137  PUSH_CONST  172
+       139  PUSH_CONST  72
+       141  PUSH_CONST  175
+       143  NEW_ARR  0
+       145  PUSH_CONST  176
+       147  PUSH_CONST  72
+       149  NEW_OBJ  3
+       151  RET
+       152  PUSH_CONST  190
+       154  PUSH_CONST  72
+       156  CALL_HOST  13, 2
+       159  DUP
+       160  PUSH_CONST  191
+       162  ARR_GET
+       163  LOAD  3
+       165  CALL_METHOD  1
+       167  STORE  4
+       169  LOAD  4
+       171  PUSH_CONST  192
+       173  ARR_GET
+       174  JNZ  245
+       176  PUSH_CONST  72
+       178  JNZ  245
+       180  PUSH_FALSE
+       181  JMP  246
+       183  PUSH_TRUE
+       184  DUP
+       185  PUSH_CONST  188
+       187  ARR_GET
+       188  CALL_METHOD  0
+       190  STORE  5
+       192  PUSH_CONST  172
+       194  LOAD  4
+       196  PUSH_CONST  25
+       198  ARR_GET
+       199  DUP
+       200  PUSH_CONST  145
+       202  ARR_GET
+       203  CALL_METHOD  0
+       205  PUSH_CONST  175
+       207  LOAD  5
+       209  JZ  305
+       212  LOAD  5
+       214  DUP
+       215  PUSH_CONST  63
+       217  ARR_GET
+       218  PUSH_CONST  193
+       220  PUSH_CONST  72
+       222  CALL_HOST  13, 2
+       225  CALL_METHOD  1
+       227  JMP  308
+       230  NEW_ARR  0
+       232  PUSH_CONST  176
+       234  LOAD  5
+       236  NEW_OBJ  3
+       238  RET
+       239  PUSH_NULL
+       240  RET
+
+#2  parseDuration   <client>   (compiled as: _p3cbKBs)
+    identity client | params 2 | locals 4 | level weak
+    scope: [0] args (param), [1] defaultUnit (param), [2] match, [3] scale
+    bytecode:
+         0  LOAD  0
+         2  PUSH_CONST  61
+         4  ARR_GET
+         5  NOT
+         6  JZ  13
+         8  PUSH_NULL
+         9  RET
+        10  PUSH_CONST  194
+        12  PUSH_CONST  12
+        14  CALL_HOST  13, 2
+        17  DUP
+        18  PUSH_CONST  191
+        20  ARR_GET
+        21  LOAD  0
+        23  DUP
+        24  PUSH_CONST  130
+        26  ARR_GET
+        27  PUSH_CONST  72
+        29  CALL_METHOD  1
+        31  CALL_METHOD  1
+        33  STORE  2
+        35  LOAD  2
+        37  NOT
+        38  JZ  55
+        40  PUSH_NULL
+        41  RET
+        42  PUSH_CONST  23
+        44  CALL_HOST  43, 1
+        47  LOAD  2
+        49  PUSH_CONST  192
+        51  ARR_GET
+        52  JNZ  82
+        54  LOAD  1
+        56  JNZ  82
+        58  PUSH_FALSE
+        59  JMP  83
+        61  PUSH_TRUE
+        62  DUP
+        63  PUSH_CONST  145
+        65  ARR_GET
+        66  CALL_METHOD  0
+        68  ARR_GET
+        69  STORE  3
+        71  LOAD  3
+        73  NOT
+        74  JZ  103
+        76  PUSH_NULL
+        77  RET
+        78  PUSH_CONST  195
+        80  CALL_HOST  43, 1
+        83  DUP
+        84  PUSH_CONST  196
+        86  ARR_GET
+        87  PUSH_CONST  197
+        89  CALL_HOST  43, 1
+        92  LOAD  2
+        94  PUSH_CONST  25
+        96  ARR_GET
+        97  CALL_VALUE  1
+        99  LOAD  3
+       101  MUL
+       102  CALL_METHOD  1
+       104  RET
+       105  PUSH_NULL
+       106  RET
+
+#3  formatDuration   <client>   (compiled as: _dDUxmBY)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] ms (param)
+    bytecode:
+         0  LOAD  0
+         2  PUSH_CONST  33
+         4  GTE
+         5  JZ  28
+         7  LOAD  0
+         9  PUSH_CONST  33
+        11  MOD
+        12  PUSH_CONST  7
+        14  EQ
+        15  JZ  28
+        17  PUSH_TRUE
+        18  JMP  29
+        20  PUSH_FALSE
+        21  JZ  48
+        23  PUSH_CONST  72
+        25  LOAD  0
+        27  PUSH_CONST  33
+        29  DIV
+        30  ADD
+        31  PUSH_CONST  32
+        33  ADD
+        34  RET
+        35  LOAD  0
+        37  PUSH_CONST  30
+        39  GTE
+        40  JZ  76
+        42  LOAD  0
+        44  PUSH_CONST  30
+        46  MOD
+        47  PUSH_CONST  7
+        49  EQ
+        50  JZ  76
+        52  PUSH_TRUE
+        53  JMP  77
+        55  PUSH_FALSE
+        56  JZ  96
+        58  PUSH_CONST  72
+        60  LOAD  0
+        62  PUSH_CONST  30
+        64  DIV
+        65  ADD
+        66  PUSH_CONST  29
+        68  ADD
+        69  RET
+        70  LOAD  0
+        72  PUSH_CONST  27
+        74  MOD
+        75  PUSH_CONST  7
+        77  EQ
+        78  JZ  126
+        80  PUSH_CONST  72
+        82  LOAD  0
+        84  PUSH_CONST  27
+        86  DIV
+        87  ADD
+        88  PUSH_CONST  26
+        90  ADD
+        91  RET
+        92  PUSH_CONST  72
+        94  LOAD  0
+        96  ADD
+        97  PUSH_CONST  24
+        99  ADD
+       100  RET
+       101  PUSH_NULL
+       102  RET
+
+#4  onOff   <client>   (compiled as: _tTaFuJ8hoFw)
+    identity client | params 1 | locals 2 | level weak
+    scope: [0] args (param), [1] word
+    bytecode:
+         0  LOAD  0
+         2  PUSH_CONST  7
+         4  ARR_GET
+         5  JNZ  20
+         7  PUSH_CONST  72
+         9  JNZ  20
+        11  PUSH_FALSE
+        12  JMP  21
+        14  PUSH_TRUE
+        15  DUP
+        16  PUSH_CONST  145
+        18  ARR_GET
+        19  CALL_METHOD  0
+        21  STORE  1
+        23  PUSH_CONST  113
+        25  PUSH_CONST  198
+        27  PUSH_CONST  199
+        29  PUSH_CONST  200
+        31  PUSH_CONST  201
+        33  NEW_ARR  5
+        35  DUP
+        36  PUSH_CONST  151
+        38  ARR_GET
+        39  LOAD  1
+        41  CALL_METHOD  1
+        43  JZ  64
+        45  PUSH_TRUE
+        46  RET
+        47  PUSH_CONST  114
+        49  PUSH_CONST  202
+        51  PUSH_CONST  203
+        53  PUSH_CONST  204
+        55  PUSH_CONST  205
+        57  NEW_ARR  5
+        59  DUP
+        60  PUSH_CONST  151
+        62  ARR_GET
+        63  LOAD  1
+        65  CALL_METHOD  1
+        67  JZ  97
+        69  PUSH_FALSE
+        70  RET
+        71  PUSH_NULL
+        72  RET
+        73  PUSH_NULL
+        74  RET
+
+#5  stripCodes   <client>   (compiled as: _B9ShEpuLU)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] text (param)
+    bytecode:
+         0  PUSH_CONST  206
+         2  CALL_HOST  43, 1
+         5  LOAD  0
+         7  PUSH_NULL
+         8  EQ
+         9  JZ  21
+        11  PUSH_CONST  72
+        13  JMP  24
+        15  LOAD  0
+        17  CALL_VALUE  1
+        19  DUP
+        20  PUSH_CONST  207
+        22  ARR_GET
+        23  PUSH_CONST  208
+        25  PUSH_CONST  209
+        27  CALL_HOST  13, 2
+        30  PUSH_CONST  72
+        32  CALL_METHOD  2
+        34  RET
+        35  PUSH_NULL
+        36  RET
+
+#6  plainText   <client>   (compiled as: _vRGP45QlmVW)
+    identity client | params 1 | locals 3 | level weak
+    scope: [0] node (param), [1] trimmed, [2] out
+    bytecode:
+         0  LOAD  0
+         2  PUSH_NULL
+         3  EQ
+         4  JZ  12
+         6  PUSH_CONST  72
+         8  RET
+         9  LOAD  0
+        11  CALL_HOST  186, 1
+        14  PUSH_CONST  187
+        16  EQ
+        17  JZ  125
+        19  LOAD  0
+        21  DUP
+        22  PUSH_CONST  188
+        24  ARR_GET
+        25  CALL_METHOD  0
+        27  STORE  1
+        29  LOAD  1
+        31  DUP
+        32  PUSH_CONST  189
+        34  ARR_GET
+        35  PUSH_CONST  210
+        37  CALL_METHOD  1
+        39  JNZ  75
+        41  LOAD  1
+        43  DUP
+        44  PUSH_CONST  189
+        46  ARR_GET
+        47  PUSH_CONST  211
+        49  CALL_METHOD  1
+        51  JNZ  75
+        53  PUSH_FALSE
+        54  JMP  76
+        56  PUSH_TRUE
+        57  JZ  117
+        59  TRY  108
+        61  PUSH_CONST  212
+        63  CALL_HOST  43, 1
+        66  DUP
+        67  PUSH_CONST  213
+        69  ARR_GET
+        70  LOAD  1
+        72  CALL_METHOD  1
+        74  CALL  6, 1
+        77  RET
+        78  END_TRY
+        79  JMP  117
+        81  POP
+        82  LOAD  0
+        84  CALL  5, 1
+        87  RET
+        88  LOAD  0
+        90  CALL  5, 1
+        93  RET
+        94  PUSH_CONST  214
+        96  CALL_HOST  43, 1
+        99  DUP
+       100  PUSH_CONST  215
+       102  ARR_GET
+       103  LOAD  0
+       105  CALL_METHOD  1
+       107  JZ  169
+       109  LOAD  0
+       111  DUP
+       112  PUSH_CONST  142
+       114  ARR_GET
+       115  CLOSURE  6
+       117  CALL_METHOD  1
+       119  DUP
+       120  PUSH_CONST  130
+       122  ARR_GET
+       123  PUSH_CONST  72
+       125  CALL_METHOD  1
+       127  RET
+       128  LOAD  0
+       130  CALL_HOST  186, 1
+       133  PUSH_CONST  216
+       135  NEQ
+       136  JZ  196
+       138  PUSH_CONST  206
+       140  CALL_HOST  43, 1
+       143  LOAD  0
+       145  CALL_VALUE  1
+       147  RET
+       148  LOAD  0
+       150  PUSH_CONST  217
+       152  ARR_GET
+       153  JZ  218
+       155  LOAD  0
+       157  PUSH_CONST  217
+       159  ARR_GET
+       160  CALL  6, 1
+       163  RET
+       164  PUSH_CONST  72
+       166  STORE  2
+       168  LOAD  0
+       170  PUSH_CONST  218
+       172  ARR_GET
+       173  CALL_HOST  186, 1
+       176  PUSH_CONST  187
+       178  EQ
+       179  JZ  260
+       182  LOAD  2
+       184  LOAD  0
+       186  PUSH_CONST  218
+       188  ARR_GET
+       189  CALL  5, 1
+       192  ADD
+       193  STORE  2
+       195  LOAD  0
+       197  PUSH_CONST  72
+       199  ARR_GET
+       200  CALL_HOST  186, 1
+       203  PUSH_CONST  187
+       205  EQ
+       206  JZ  296
+       209  LOAD  2
+       211  LOAD  0
+       213  PUSH_CONST  72
+       215  ARR_GET
+       216  CALL  5, 1
+       219  ADD
+       220  STORE  2
+       222  PUSH_CONST  214
+       224  CALL_HOST  43, 1
+       227  DUP
+       228  PUSH_CONST  215
+       230  ARR_GET
+       231  LOAD  0
+       233  PUSH_CONST  219
+       235  ARR_GET
+       236  CALL_METHOD  1
+       238  JZ  354
+       241  LOAD  2
+       243  LOAD  0
+       245  PUSH_CONST  219
+       247  ARR_GET
+       248  DUP
+       249  PUSH_CONST  142
+       251  ARR_GET
+       252  CLOSURE  6
+       254  CALL_METHOD  1
+       256  DUP
+       257  PUSH_CONST  130
+       259  ARR_GET
+       260  PUSH_CONST  143
+       262  CALL_METHOD  1
+       264  ADD
+       265  STORE  2
+       267  PUSH_CONST  214
+       269  CALL_HOST  43, 1
+       272  DUP
+       273  PUSH_CONST  215
+       275  ARR_GET
+       276  LOAD  0
+       278  PUSH_CONST  220
+       280  ARR_GET
+       281  CALL_METHOD  1
+       283  JZ  412
+       286  LOAD  2
+       288  LOAD  0
+       290  PUSH_CONST  220
+       292  ARR_GET
+       293  DUP
+       294  PUSH_CONST  142
+       296  ARR_GET
+       297  CLOSURE  6
+       299  CALL_METHOD  1
+       301  DUP
+       302  PUSH_CONST  130
+       304  ARR_GET
+       305  PUSH_CONST  72
+       307  CALL_METHOD  1
+       309  ADD
+       310  STORE  2
+       312  LOAD  2
+       314  RET
+       315  PUSH_NULL
+       316  RET
+
+#7  parseMoney   <client>   (compiled as: _r3ILE5cJaTI)
+    identity client | params 1 | locals 4 | level weak
+    scope: [0] text (param), [1] match, [2] amount, [3] suffix
+    bytecode:
+         0  PUSH_CONST  221
+         2  PUSH_CONST  12
+         4  CALL_HOST  13, 2
+         7  DUP
+         8  PUSH_CONST  191
+        10  ARR_GET
+        11  PUSH_CONST  206
+        13  CALL_HOST  43, 1
+        16  LOAD  0
+        18  CALL_VALUE  1
+        20  CALL_METHOD  1
+        22  STORE  1
+        24  LOAD  1
+        26  NOT
+        27  JZ  41
+        29  PUSH_NULL
+        30  RET
+        31  PUSH_CONST  197
+        33  CALL_HOST  43, 1
+        36  LOAD  1
+        38  PUSH_CONST  25
+        40  ARR_GET
+        41  DUP
+        42  PUSH_CONST  207
+        44  ARR_GET
+        45  PUSH_CONST  222
+        47  PUSH_CONST  223
+        49  CALL_HOST  13, 2
+        52  PUSH_CONST  72
+        54  CALL_METHOD  2
+        56  CALL_VALUE  1
+        58  STORE  2
+        60  PUSH_CONST  197
+        62  CALL_HOST  43, 1
+        65  DUP
+        66  PUSH_CONST  224
+        68  ARR_GET
+        69  LOAD  2
+        71  CALL_METHOD  1
+        73  NOT
+        74  JZ  103
+        76  PUSH_NULL
+        77  RET
+        78  LOAD  1
+        80  PUSH_CONST  192
+        82  ARR_GET
+        83  JZ  142
+        85  PUSH_CONST  35
+        87  CALL_HOST  43, 1
+        90  LOAD  1
+        92  PUSH_CONST  192
+        94  ARR_GET
+        95  DUP
+        96  PUSH_CONST  145
+        98  ARR_GET
+        99  CALL_METHOD  0
+       101  ARR_GET
+       102  JZ  142
+       104  PUSH_TRUE
+       105  JMP  143
+       107  PUSH_FALSE
+       108  STORE  3
+       110  LOAD  3
+       112  JZ  162
+       114  LOAD  2
+       116  LOAD  3
+       118  MUL
+       119  JMP  165
+       121  LOAD  2
+       123  RET
+       124  PUSH_NULL
+       125  RET
+
+#8  formatMoney   <client>   (compiled as: _HZor6fqhe)
+    identity client | params 1 | locals 6 | level weak
+    scope: [0] amount (param), [1] units, [2] __d0, [3] __d1, [4] size, [5] tag
+    bytecode:
+         0  PUSH_CONST  197
+         2  CALL_HOST  43, 1
+         5  DUP
+         6  PUSH_CONST  224
+         8  ARR_GET
+         9  LOAD  0
+        11  CALL_METHOD  1
+        13  NOT
+        14  JZ  34
+        16  PUSH_CONST  206
+        18  CALL_HOST  43, 1
+        21  LOAD  0
+        23  CALL_VALUE  1
+        25  RET
+        26  PUSH_CONST  41
+        28  PUSH_CONST  225
+        30  NEW_ARR  2
+        32  PUSH_CONST  39
+        34  PUSH_CONST  226
+        36  NEW_ARR  2
+        38  PUSH_CONST  37
+        40  PUSH_CONST  227
+        42  NEW_ARR  2
+        44  PUSH_CONST  27
+        46  PUSH_CONST  228
+        48  NEW_ARR  2
+        50  NEW_ARR  4
+        52  STORE  1
+        54  LOAD  1
+        56  STORE  2
+        58  PUSH_CONST  7
+        60  STORE  3
+        62  LOAD  3
+        64  LOAD  2
+        66  CALL_HOST  56, 1
+        69  LT
+        70  JZ  193
+        72  LOAD  2
+        74  LOAD  3
+        76  ARR_GET
+        77  PUSH_CONST  7
+        79  ARR_GET
+        80  STORE  4
+        82  LOAD  2
+        84  LOAD  3
+        86  ARR_GET
+        87  PUSH_CONST  25
+        89  ARR_GET
+        90  STORE  5
+        92  PUSH_CONST  195
+        94  CALL_HOST  43, 1
+        97  DUP
+        98  PUSH_CONST  229
+       100  ARR_GET
+       101  LOAD  0
+       103  CALL_METHOD  1
+       105  LOAD  4
+       107  GTE
+       108  JZ  180
+       110  PUSH_CONST  72
+       112  LOAD  0
+       114  LOAD  4
+       116  DIV
+       117  DUP
+       118  PUSH_CONST  230
+       120  ARR_GET
+       121  PUSH_CONST  192
+       123  CALL_METHOD  1
+       125  ADD
+       126  LOAD  5
+       128  ADD
+       129  RET
+       130  LOAD  3
+       132  PUSH_CONST  25
+       134  ADD
+       135  STORE  3
+       137  JMP  88
+       139  PUSH_CONST  206
+       141  CALL_HOST  43, 1
+       144  PUSH_CONST  195
+       146  CALL_HOST  43, 1
+       149  DUP
+       150  PUSH_CONST  196
+       152  ARR_GET
+       153  LOAD  0
+       155  CALL_METHOD  1
+       157  CALL_VALUE  1
+       159  RET
+       160  PUSH_NULL
+       161  RET
+
+#9  $anon   <client>   (compiled as: _RjMvQD8bq)
+    identity client | params 2 | locals 2 | level weak | async
+    scope: [0] bot (param), [1] api (param)
+    bytecode:
+         0  LOAD_THIS
+         1  PUSH_CONST  48
+         3  LOAD  0
+         5  PUSH_CONST  49
+         7  ARR_GET
+         8  AWAIT
+         9  ARR_SET
+        10  POP
+        11  LOAD_THIS
+        12  PUSH_CONST  50
+        14  PUSH_CONST  1
+        16  NEW_ARR  0
+        18  DUP
+        19  PUSH_CONST  0
+        21  CALL_HOST  43, 1
+        24  PUSH_CONST  1
+        26  ARR_GET
+        27  CALL_HOST  51, 2
+        30  POP
+        31  NEW_OBJ  1
+        33  ARR_SET
+        34  POP
+        35  LOAD_THIS
+        36  PUSH_CONST  52
+        38  NEW_ARR  0
+        40  ARR_SET
+        41  POP
+        42  LOAD_THIS
+        43  PUSH_CONST  53
+        45  PUSH_NULL
+        46  ARR_SET
+        47  POP
+        48  LOAD_THIS
+        49  PUSH_CONST  54
+        51  PUSH_NULL
+        52  ARR_SET
+        53  POP
+        54  LOAD_THIS
+        55  PUSH_CONST  55
+        57  CLOSURE  10
+        59  ARR_SET
+        60  POP
+        61  LOAD_THIS
+        62  PUSH_CONST  60
+        64  CLOSURE  11
+        66  ARR_SET
+        67  POP
+        68  LOAD_THIS
+        69  PUSH_CONST  64
+        71  CLOSURE  12
+        73  ARR_SET
+        74  POP
+        75  LOAD_THIS
+        76  PUSH_CONST  77
+        78  CLOSURE  17
+        80  ARR_SET
+        81  POP
+        82  LOAD_THIS
+        83  PUSH_CONST  84
+        85  CLOSURE  18
+        87  ARR_SET
+        88  POP
+        89  LOAD_THIS
+        90  PUSH_CONST  87
+        92  PUSH_CONST  88
+        94  PUSH_CONST  89
+        96  PUSH_CONST  88
+        98  PUSH_CONST  90
+       100  PUSH_CONST  91
+       102  PUSH_CONST  92
+       104  CLOSURE  21
+       106  NEW_OBJ  3
+       108  PUSH_CONST  2
+       110  PUSH_CONST  89
+       112  PUSH_CONST  93
+       114  PUSH_CONST  90
+       116  PUSH_CONST  94
+       118  PUSH_CONST  92
+       120  CLOSURE  22
+       122  NEW_OBJ  3
+       124  PUSH_CONST  6
+       126  PUSH_CONST  89
+       128  PUSH_CONST  98
+       130  PUSH_CONST  90
+       132  PUSH_CONST  99
+       134  PUSH_CONST  92
+       136  CLOSURE  23
+       138  NEW_OBJ  3
+       140  PUSH_CONST  4
+       142  PUSH_CONST  89
+       144  PUSH_CONST  104
+       146  PUSH_CONST  90
+       148  PUSH_CONST  105
+       150  PUSH_CONST  92
+       152  CLOSURE  24
+       154  NEW_OBJ  3
+       156  PUSH_CONST  8
+       158  PUSH_CONST  89
+       160  PUSH_CONST  110
+       162  PUSH_CONST  90
+       164  PUSH_CONST  111
+       166  PUSH_CONST  92
+       168  CLOSURE  25
+       170  NEW_OBJ  3
+       172  PUSH_CONST  117
+       174  PUSH_CONST  89
+       176  PUSH_CONST  118
+       178  PUSH_CONST  90
+       180  PUSH_CONST  119
+       182  PUSH_CONST  92
+       184  CLOSURE  26
+       186  NEW_OBJ  3
+       188  PUSH_CONST  121
+       190  PUSH_CONST  89
+       192  PUSH_CONST  121
+       194  PUSH_CONST  90
+       196  PUSH_CONST  122
+       198  PUSH_CONST  92
+       200  CLOSURE  27
+       202  NEW_OBJ  3
+       204  PUSH_CONST  90
+       206  PUSH_CONST  89
+       208  PUSH_CONST  90
+       210  PUSH_CONST  90
+       212  PUSH_CONST  133
+       214  PUSH_CONST  92
+       216  CLOSURE  28
+       218  NEW_OBJ  3
+       220  NEW_OBJ  8
+       222  ARR_SET
+       223  POP
+       224  LOAD_THIS
+       225  PUSH_CONST  135
+       227  PUSH_CONST  45
+       229  PUSH_CONST  16
+       231  CALL_HOST  43, 1
+       234  PUSH_CONST  7
+       236  ARR_GET
+       237  PUSH_CONST  136
+       239  PUSH_CONST  16
+       241  CALL_HOST  43, 1
+       244  DUP
+       245  PUSH_CONST  137
+       247  ARR_GET
+       248  PUSH_CONST  25
+       250  CALL_METHOD  1
+       252  PUSH_CONST  89
+       254  PUSH_CONST  14
+       256  CALL_HOST  43, 1
+       259  PUSH_CONST  16
+       261  CALL_HOST  43, 1
+       264  PUSH_CONST  7
+       266  ARR_GET
+       267  ADD
+       268  PUSH_CONST  138
+       270  PUSH_CONST  21
+       272  CALL_HOST  43, 1
+       275  PUSH_CONST  139
+       277  PUSH_CONST  140
+       279  CALL_HOST  43, 1
+       282  DUP
+       283  PUSH_CONST  141
+       285  ARR_GET
+       286  LOAD_THIS
+       287  PUSH_CONST  87
+       289  ARR_GET
+       290  CALL_METHOD  1
+       292  DUP
+       293  PUSH_CONST  142
+       295  ARR_GET
+       296  CLOSURE  29
+       298  CALL_METHOD  1
+       300  NEW_OBJ  5
+       302  NEW_ARR  1
+       304  ARR_SET
+       305  POP
+       306  LOAD_THIS
+       307  PUSH_CONST  120
+       309  CLOSURE  30
+       311  ARR_SET
+       312  POP
+       313  LOAD_THIS
+       314  PUSH_CONST  134
+       316  CLOSURE  31
+       318  ARR_SET
+       319  POP
+       320  LOAD_THIS
+       321  PUSH_CONST  169
+       323  CLOSURE  33
+       325  ARR_SET
+       326  POP
+       327  LOAD_THIS
+       328  PUSH_CONST  170
+       330  CLOSURE  34
+       332  ARR_SET
+       333  POP
+       334  LOAD_THIS
+       335  PUSH_CONST  178
+       337  CLOSURE  37
+       339  ARR_SET
+       340  POP
+       341  LOAD_THIS
+       342  PUSH_CONST  179
+       344  CLOSURE  38
+       346  ARR_SET
+       347  POP
+       348  LOAD  1
+       350  DUP
+       351  PUSH_CONST  113
+       353  ARR_GET
+       354  PUSH_CONST  75
+       356  LOAD_THIS
+       357  PUSH_CONST  60
+       359  ARR_GET
+       360  CALL_METHOD  2
+       362  POP
+       363  LOAD  1
+       365  DUP
+       366  PUSH_CONST  113
+       368  ARR_GET
+       369  PUSH_CONST  69
+       371  LOAD_THIS
+       372  PUSH_CONST  178
+       374  ARR_GET
+       375  CALL_METHOD  2
+       377  POP
+       378  LOAD  1
+       380  DUP
+       381  PUSH_CONST  113
+       383  ARR_GET
+       384  PUSH_CONST  171
+       386  LOAD_THIS
+       387  PUSH_CONST  179
+       389  ARR_GET
+       390  CALL_METHOD  2
+       392  POP
+       393  LOAD_THIS
+       394  DUP
+       395  PUSH_CONST  84
+       397  ARR_GET
+       398  CALL_METHOD  0
+       400  POP
+       401  LOAD  1
+       403  DUP
+       404  PUSH_CONST  71
+       406  ARR_GET
+       407  PUSH_CONST  72
+       409  PUSH_CONST  180
+       411  ADD
+       412  PUSH_CONST  14
+       414  CALL_HOST  43, 1
+       417  ADD
+       418  PUSH_CONST  16
+       420  CALL_HOST  43, 1
+       423  PUSH_CONST  7
+       425  ARR_GET
+       426  ADD
+       427  PUSH_CONST  181
+       429  ADD
+       430  LOAD_THIS
+       431  PUSH_CONST  50
+       433  ARR_GET
+       434  PUSH_CONST  2
+       436  ARR_GET
+       437  ADD
+       438  PUSH_CONST  182
+       440  ADD
+       441  PUSH_CONST  14
+       443  CALL_HOST  43, 1
+       446  ADD
+       447  PUSH_CONST  16
+       449  CALL_HOST  43, 1
+       452  PUSH_CONST  7
+       454  ARR_GET
+       455  ADD
+       456  PUSH_CONST  183
+       458  ADD
+       459  CALL_METHOD  1
+       461  POP
+       462  PUSH_NULL
+       463  RET
+
+#10  $anon   <client>   (compiled as: _DVUPuletyHu)
+    identity client | params 1 | locals 5 | level weak
+    scope: [0] value (param), [1] waiting, [2] __d2, [3] __d3, [4] waiter
+    bytecode:
+         0  LOAD_THIS
+         1  PUSH_CONST  52
+         3  ARR_GET
+         4  STORE  1
+         6  LOAD_THIS
+         7  PUSH_CONST  52
+         9  NEW_ARR  0
+        11  ARR_SET
+        12  POP
+        13  LOAD  1
+        15  STORE  2
+        17  PUSH_CONST  7
+        19  STORE  3
+        21  LOAD  3
+        23  LOAD  2
+        25  CALL_HOST  56, 1
+        28  LT
+        29  JZ  97
+        31  LOAD  2
+        33  LOAD  3
+        35  ARR_GET
+        36  STORE  4
+        38  PUSH_CONST  57
+        40  CALL_HOST  43, 1
+        43  LOAD  4
+        45  PUSH_CONST  58
+        47  ARR_GET
+        48  CALL_VALUE  1
+        50  POP
+        51  LOAD  4
+        53  DUP
+        54  PUSH_CONST  59
+        56  ARR_GET
+        57  LOAD  0
+        59  CALL_METHOD  1
+        61  POP
+        62  LOAD  3
+        64  PUSH_CONST  25
+        66  ADD
+        67  STORE  3
+        69  JMP  29
+        71  PUSH_NULL
+        72  RET
+
+#11  $anon   <client>   (compiled as: _PJg1ORgPkha)
+    identity client | params 1 | locals 4 | level weak
+    scope: [0] jsonMsg (param), [1] text, [2] after, [3] amount
+    bytecode:
+         0  LOAD_THIS
+         1  PUSH_CONST  52
+         3  ARR_GET
+         4  PUSH_CONST  61
+         6  ARR_GET
+         7  PUSH_CONST  7
+         9  EQ
+        10  JZ  18
+        12  PUSH_NULL
+        13  RET
+        14  LOAD  0
+        16  CALL  6, 1
+        19  STORE  1
+        21  PUSH_CONST  10
+        23  CALL_HOST  43, 1
+        26  DUP
+        27  PUSH_CONST  62
+        29  ARR_GET
+        30  LOAD  1
+        32  CALL_METHOD  1
+        34  NOT
+        35  JZ  51
+        37  PUSH_NULL
+        38  RET
+        39  LOAD  1
+        41  DUP
+        42  PUSH_CONST  63
+        44  ARR_GET
+        45  PUSH_CONST  10
+        47  CALL_HOST  43, 1
+        50  CALL_METHOD  1
+        52  PUSH_CONST  25
+        54  ARR_GET
+        55  STORE  2
+        57  LOAD  2
+        59  PUSH_NULL
+        60  EQ
+        61  JZ  89
+        63  LOAD  1
+        65  JMP  92
+        67  LOAD  2
+        69  CALL  7, 1
+        72  STORE  3
+        74  LOAD  3
+        76  PUSH_NULL
+        77  EQ
+        78  JZ  109
+        80  PUSH_NULL
+        81  RET
+        82  LOAD_THIS
+        83  PUSH_CONST  53
+        85  LOAD  3
+        87  ARR_SET
+        88  POP
+        89  LOAD_THIS
+        90  DUP
+        91  PUSH_CONST  55
+        93  ARR_GET
+        94  LOAD  3
+        96  CALL_METHOD  1
+        98  POP
+        99  PUSH_NULL
+       100  RET
+
+#12  $anon   <client>   (compiled as: _jlSn6fGhQ)
+    identity client | params 0 | locals 0 | level weak
+    scope: (none)
+    upvalues: _xz8RANsFy, _z7KbY9u
+    bytecode:
+         0  PUSH_CONST  65
+         2  CALL_HOST  43, 1
+         5  CLOSURE  13
+         7  CALL_HOST  76, 2
+        10  CLOSE_UPVALUE  0
+        12  CLOSE_UPVALUE  1
+        14  RET
+        15  PUSH_NULL
+        16  CLOSE_UPVALUE  0
+        18  CLOSE_UPVALUE  1
+        20  RET
+
+#13  $anon   <client>   (compiled as: _v1ODUng3cn6)
+    identity client | params 1 | locals 2 | level weak
+    scope: [0] resolve (param), [1] waiter
+    upvalues: _r3ivipMNkRy, _bTUjAn4DQLI
+    bytecode:
+         0  PUSH_CONST  59
+         2  LOAD  0
+         4  PUSH_CONST  58
+         6  PUSH_NULL
+         7  NEW_OBJ  2
+         9  STORE  1
+        11  LOAD  1
+        13  PUSH_CONST  58
+        15  PUSH_CONST  66
+        17  CALL_HOST  43, 1
+        20  CLOSURE  14
+        22  LOAD_THIS
+        23  PUSH_CONST  50
+        25  ARR_GET
+        26  PUSH_CONST  4
+        28  ARR_GET
+        29  CALL_VALUE  2
+        31  ARR_SET
+        32  POP
+        33  LOAD_THIS
+        34  PUSH_CONST  52
+        36  ARR_GET
+        37  DUP
+        38  PUSH_CONST  68
+        40  ARR_GET
+        41  LOAD  1
+        43  CALL_METHOD  1
+        45  POP
+        46  LOAD_UP  0
+        48  DUP
+        49  PUSH_CONST  69
+        51  ARR_GET
+        52  LOAD_THIS
+        53  PUSH_CONST  50
+        55  ARR_GET
+        56  PUSH_CONST  2
+        58  ARR_GET
+        59  CALL_METHOD  1
+        61  DUP
+        62  PUSH_CONST  70
+        64  ARR_GET
+        65  CLOSURE  16
+        67  CALL_METHOD  1
+        69  POP
+        70  PUSH_NULL
+        71  RET
+
+#14  $anon   <client>   (compiled as: _zbkbKDgpU)
+    identity client | params 0 | locals 0 | level weak
+    scope: (none)
+    upvalues: _FHQNG1m9k, _DF05mjGbYn4
+    bytecode:
+         0  LOAD_THIS
+         1  PUSH_CONST  52
+         3  LOAD_THIS
+         4  PUSH_CONST  52
+         6  ARR_GET
+         7  DUP
+         8  PUSH_CONST  67
+        10  ARR_GET
+        11  CLOSURE  15
+        13  CALL_METHOD  1
+        15  ARR_SET
+        16  POP
+        17  LOAD_UP  1
+        19  PUSH_NULL
+        20  CALL_VALUE  1
+        22  POP
+        23  PUSH_NULL
+        24  CLOSE_UPVALUE  1
+        26  CLOSE_UPVALUE  0
+        28  RET
+
+#15  $anon   <client>   (compiled as: _HD8N0hg)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] w (param)
+    upvalues: _zB09KNA5mDs
+    bytecode:
+         0  LOAD  0
+         2  LOAD_UP  0
+         4  NEQ
+         5  RET
+         6  PUSH_NULL
+         7  RET
+
+#16  $anon   <client>   (compiled as: _DbWlA7e)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] err (param)
+    upvalues: _rDmpGlSPu
+    bytecode:
+         0  LOAD_UP  0
+         2  DUP
+         3  PUSH_CONST  71
+         5  ARR_GET
+         6  PUSH_CONST  72
+         8  PUSH_CONST  73
+        10  ADD
+        11  LOAD_THIS
+        12  PUSH_CONST  50
+        14  ARR_GET
+        15  PUSH_CONST  2
+        17  ARR_GET
+        18  ADD
+        19  PUSH_CONST  74
+        21  ADD
+        22  LOAD  0
+        24  PUSH_CONST  75
+        26  ARR_GET
+        27  ADD
+        28  CALL_METHOD  1
+        30  POP
+        31  PUSH_NULL
+        32  RET
+
+#17  $anon   <client>   (compiled as: _JrEFYF8)
+    identity client | params 2 | locals 3 | level weak | async
+    scope: [0] reply (param), [1] announce (param), [2] balance
+    upvalues: _t3GdwNMbOlk
+    bytecode:
+         0  LOAD_THIS
+         1  DUP
+         2  PUSH_CONST  64
+         4  ARR_GET
+         5  CALL_METHOD  0
+         7  AWAIT
+         8  STORE  2
+        10  LOAD  2
+        12  PUSH_NULL
+        13  EQ
+        14  JZ  70
+        16  LOAD  0
+        18  PUSH_CONST  72
+        20  PUSH_CONST  78
+        22  ADD
+        23  LOAD_THIS
+        24  PUSH_CONST  50
+        26  ARR_GET
+        27  PUSH_CONST  2
+        29  ARR_GET
+        30  ADD
+        31  PUSH_CONST  79
+        33  ADD
+        34  LOAD_THIS
+        35  PUSH_CONST  50
+        37  ARR_GET
+        38  PUSH_CONST  4
+        40  ARR_GET
+        41  CALL  3, 1
+        44  ADD
+        45  PUSH_CONST  80
+        47  ADD
+        48  CALL_VALUE  1
+        50  POP
+        51  PUSH_NULL
+        52  CLOSE_UPVALUE  0
+        54  RET
+        55  LOAD  0
+        57  PUSH_CONST  72
+        59  PUSH_CONST  81
+        61  ADD
+        62  LOAD  2
+        64  CALL  8, 1
+        67  ADD
+        68  PUSH_CONST  82
+        70  ADD
+        71  LOAD  2
+        73  ADD
+        74  PUSH_CONST  83
+        76  ADD
+        77  CALL_VALUE  1
+        79  POP
+        80  LOAD  1
+        82  JZ  125
+        84  LOAD_THIS
+        85  PUSH_CONST  50
+        87  ARR_GET
+        88  PUSH_CONST  8
+        90  ARR_GET
+        91  JZ  125
+        93  PUSH_TRUE
+        94  JMP  126
+        96  PUSH_FALSE
+        97  JZ  156
+        99  LOAD_UP  0
+       101  DUP
+       102  PUSH_CONST  69
+       104  ARR_GET
+       105  PUSH_CONST  72
+       107  PUSH_CONST  81
+       109  ADD
+       110  LOAD  2
+       112  CALL  8, 1
+       115  ADD
+       116  CALL_METHOD  1
+       118  AWAIT
+       119  POP
+       120  LOAD  2
+       122  CLOSE_UPVALUE  0
+       124  RET
+       125  PUSH_NULL
+       126  CLOSE_UPVALUE  0
+       128  RET
+
+#18  $anon   <client>   (compiled as: _BviBuTKhy3M)
+    identity client | params 0 | locals 0 | level weak
+    scope: (none)
+    upvalues: _lfaDUFm
+    bytecode:
+         0  PUSH_CONST  85
+         2  CALL_HOST  43, 1
+         5  LOAD_THIS
+         6  PUSH_CONST  54
+         8  ARR_GET
+         9  CALL_VALUE  1
+        11  POP
+        12  LOAD_THIS
+        13  PUSH_CONST  54
+        15  PUSH_NULL
+        16  ARR_SET
+        17  POP
+        18  LOAD_THIS
+        19  PUSH_CONST  50
+        21  ARR_GET
+        22  PUSH_CONST  6
+        24  ARR_GET
+        25  PUSH_CONST  7
+        27  GT
+        28  JZ  65
+        30  LOAD_THIS
+        31  PUSH_CONST  54
+        33  PUSH_CONST  86
+        35  CALL_HOST  43, 1
+        38  CLOSURE  19
+        40  LOAD_THIS
+        41  PUSH_CONST  50
+        43  ARR_GET
+        44  PUSH_CONST  6
+        46  ARR_GET
+        47  CALL_VALUE  2
+        49  ARR_SET
+        50  POP
+        51  PUSH_NULL
+        52  CLOSE_UPVALUE  1
+        54  RET
+
+#19  $anon   <client>   (compiled as: _Vfy9UJWta)
+    identity client | params 0 | locals 0 | level weak
+    scope: (none)
+    upvalues: _b9ih6ZM
+    bytecode:
+         0  LOAD_THIS
+         1  DUP
+         2  PUSH_CONST  77
+         4  ARR_GET
+         5  CLOSURE  20
+         7  PUSH_FALSE
+         8  CALL_METHOD  2
+        10  POP
+        11  PUSH_NULL
+        12  RET
+
+#20  $anon   <client>   (compiled as: _j5YXMZ0VS)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] text (param)
+    upvalues: _FDSxi7Cf0
+    bytecode:
+         0  LOAD_UP  0
+         2  DUP
+         3  PUSH_CONST  71
+         5  ARR_GET
+         6  LOAD  0
+         8  CALL_METHOD  1
+        10  RET
+        11  PUSH_NULL
+        12  RET
+
+#21  $anon   <client>   (compiled as: _nR4FwxO)
+    identity client | params 2 | locals 2 | level weak
+    scope: [0] args (param), [1] reply (param)
+    bytecode:
+         0  LOAD_THIS
+         1  DUP
+         2  PUSH_CONST  77
+         4  ARR_GET
+         5  LOAD  1
+         7  PUSH_TRUE
+         8  CALL_METHOD  2
+        10  RET
+        11  PUSH_NULL
+        12  RET
+
+#22  $anon   <client>   (compiled as: _LRUPKP0JoT8)
+    identity client | params 3 | locals 3 | level weak
+    scope: [0] args (param), [1] reply (param), [2] rest (param)
+    bytecode:
+         0  LOAD  2
+         2  NOT
+         3  JZ  34
+         5  LOAD  1
+         7  PUSH_CONST  72
+         9  PUSH_CONST  95
+        11  ADD
+        12  LOAD_THIS
+        13  PUSH_CONST  50
+        15  ARR_GET
+        16  PUSH_CONST  2
+        18  ARR_GET
+        19  ADD
+        20  PUSH_CONST  96
+        22  ADD
+        23  CALL_VALUE  1
+        25  RET
+        26  LOAD_THIS
+        27  PUSH_CONST  50
+        29  ARR_GET
+        30  PUSH_CONST  2
+        32  LOAD  2
+        34  ARR_SET
+        35  POP
+        36  LOAD  1
+        38  PUSH_CONST  72
+        40  PUSH_CONST  97
+        42  ADD
+        43  LOAD_THIS
+        44  PUSH_CONST  50
+        46  ARR_GET
+        47  PUSH_CONST  2
+        49  ARR_GET
+        50  ADD
+        51  PUSH_CONST  80
+        53  ADD
+        54  CALL_VALUE  1
+        56  POP
+        57  PUSH_NULL
+        58  RET
+
+#23  $anon   <client>   (compiled as: _bFcxidiDsZ4)
+    identity client | params 2 | locals 3 | level weak
+    scope: [0] args (param), [1] reply (param), [2] every
+    bytecode:
+         0  LOAD  0
+         2  CALL  4, 1
+         5  PUSH_FALSE
+         6  EQ
+         7  JZ  43
+         9  LOAD_THIS
+        10  PUSH_CONST  50
+        12  ARR_GET
+        13  PUSH_CONST  6
+        15  PUSH_CONST  7
+        17  ARR_SET
+        18  POP
+        19  LOAD_THIS
+        20  DUP
+        21  PUSH_CONST  84
+        23  ARR_GET
+        24  CALL_METHOD  0
+        26  POP
+        27  LOAD  1
+        29  PUSH_CONST  100
+        31  CALL_VALUE  1
+        33  RET
+        34  LOAD  0
+        36  PUSH_CONST  26
+        38  CALL  2, 2
+        41  STORE  2
+        43  LOAD  2
+        45  PUSH_NULL
+        46  EQ
+        47  JZ  73
+        49  LOAD  1
+        51  PUSH_CONST  101
+        53  CALL_VALUE  1
+        55  RET
+        56  LOAD  2
+        58  PUSH_CONST  5
+        60  LT
+        61  JZ  92
+        63  LOAD  1
+        65  PUSH_CONST  102
+        67  CALL_VALUE  1
+        69  RET
+        70  LOAD_THIS
+        71  PUSH_CONST  50
+        73  ARR_GET
+        74  PUSH_CONST  6
+        76  LOAD  2
+        78  ARR_SET
+        79  POP
+        80  LOAD_THIS
+        81  DUP
+        82  PUSH_CONST  84
+        84  ARR_GET
+        85  CALL_METHOD  0
+        87  POP
+        88  LOAD  1
+        90  PUSH_CONST  72
+        92  PUSH_CONST  103
+        94  ADD
+        95  LOAD  2
+        97  CALL  3, 1
+       100  ADD
+       101  PUSH_CONST  80
+       103  ADD
+       104  CALL_VALUE  1
+       106  POP
+       107  PUSH_NULL
+       108  RET
+
+#24  $anon   <client>   (compiled as: _vdUTcbcHSf2)
+    identity client | params 2 | locals 3 | level weak
+    scope: [0] args (param), [1] reply (param), [2] value
+    bytecode:
+         0  LOAD  0
+         2  PUSH_CONST  26
+         4  CALL  2, 2
+         7  STORE  2
+         9  LOAD  2
+        11  PUSH_NULL
+        12  EQ
+        13  JZ  30
+        15  LOAD  1
+        17  PUSH_CONST  106
+        19  CALL_VALUE  1
+        21  RET
+        22  LOAD  2
+        24  PUSH_CONST  107
+        26  LT
+        27  JZ  49
+        29  LOAD  1
+        31  PUSH_CONST  108
+        33  CALL_VALUE  1
+        35  RET
+        36  LOAD_THIS
+        37  PUSH_CONST  50
+        39  ARR_GET
+        40  PUSH_CONST  4
+        42  LOAD  2
+        44  ARR_SET
+        45  POP
+        46  LOAD  1
+        48  PUSH_CONST  72
+        50  PUSH_CONST  109
+        52  ADD
+        53  LOAD  2
+        55  CALL  3, 1
+        58  ADD
+        59  PUSH_CONST  80
+        61  ADD
+        62  CALL_VALUE  1
+        64  POP
+        65  PUSH_NULL
+        66  RET
+
+#25  $anon   <client>   (compiled as: _LbgxIBw)
+    identity client | params 2 | locals 3 | level weak
+    scope: [0] args (param), [1] reply (param), [2] value
+    bytecode:
+         0  LOAD  0
+         2  CALL  4, 1
+         5  STORE  2
+         7  LOAD  2
+         9  PUSH_NULL
+        10  EQ
+        11  JZ  57
+        13  LOAD  1
+        15  PUSH_CONST  72
+        17  PUSH_CONST  112
+        19  ADD
+        20  LOAD_THIS
+        21  PUSH_CONST  50
+        23  ARR_GET
+        24  PUSH_CONST  8
+        26  ARR_GET
+        27  JZ  46
+        29  PUSH_CONST  113
+        31  JMP  49
+        33  PUSH_CONST  114
+        35  ADD
+        36  PUSH_CONST  115
+        38  ADD
+        39  CALL_VALUE  1
+        41  RET
+        42  LOAD_THIS
+        43  PUSH_CONST  50
+        45  ARR_GET
+        46  PUSH_CONST  8
+        48  LOAD  2
+        50  ARR_SET
+        51  POP
+        52  LOAD  1
+        54  PUSH_CONST  72
+        56  PUSH_CONST  116
+        58  ADD
+        59  LOAD  2
+        61  JZ  92
+        63  PUSH_CONST  113
+        65  JMP  95
+        67  PUSH_CONST  114
+        69  ADD
+        70  PUSH_CONST  80
+        72  ADD
+        73  CALL_VALUE  1
+        75  POP
+        76  PUSH_NULL
+        77  RET
+
+#26  $anon   <client>   (compiled as: _HBqhsbUT0)
+    identity client | params 2 | locals 2 | level weak
+    scope: [0] args (param), [1] reply (param)
+    bytecode:
+         0  LOAD_THIS
+         1  DUP
+         2  PUSH_CONST  120
+         4  ARR_GET
+         5  LOAD  0
+         7  LOAD  1
+         9  CALL_METHOD  2
+        11  RET
+        12  PUSH_NULL
+        13  RET
+
+#27  $anon   <client>   (compiled as: _xDkpspY1G)
+    identity client | params 2 | locals 2 | level weak
+    scope: [0] args (param), [1] reply (param)
+    bytecode:
+         0  LOAD  1
+         2  PUSH_CONST  72
+         4  PUSH_CONST  123
+         6  ADD
+         7  LOAD_THIS
+         8  PUSH_CONST  50
+        10  ARR_GET
+        11  PUSH_CONST  2
+        13  ARR_GET
+        14  ADD
+        15  PUSH_CONST  124
+        17  ADD
+        18  LOAD_THIS
+        19  PUSH_CONST  50
+        21  ARR_GET
+        22  PUSH_CONST  4
+        24  ARR_GET
+        25  CALL  3, 1
+        28  ADD
+        29  PUSH_CONST  125
+        31  ADD
+        32  LOAD_THIS
+        33  PUSH_CONST  50
+        35  ARR_GET
+        36  PUSH_CONST  6
+        38  ARR_GET
+        39  JZ  70
+        41  LOAD_THIS
+        42  PUSH_CONST  50
+        44  ARR_GET
+        45  PUSH_CONST  6
+        47  ARR_GET
+        48  CALL  3, 1
+        51  JMP  73
+        53  PUSH_CONST  114
+        55  ADD
+        56  PUSH_CONST  126
+        58  ADD
+        59  LOAD_THIS
+        60  PUSH_CONST  50
+        62  ARR_GET
+        63  PUSH_CONST  8
+        65  ARR_GET
+        66  JZ  96
+        68  PUSH_CONST  113
+        70  JMP  99
+        72  PUSH_CONST  114
+        74  ADD
+        75  PUSH_CONST  127
+        77  ADD
+        78  LOAD_THIS
+        79  PUSH_CONST  53
+        81  ARR_GET
+        82  PUSH_NULL
+        83  EQ
+        84  JZ  120
+        86  PUSH_CONST  128
+        88  JMP  129
+        90  LOAD_THIS
+        91  PUSH_CONST  53
+        93  ARR_GET
+        94  CALL  8, 1
+        97  ADD
+        98  PUSH_CONST  129
+       100  ADD
+       101  LOAD_THIS
+       102  PUSH_CONST  50
+       104  ARR_GET
+       105  PUSH_CONST  1
+       107  ARR_GET
+       108  PUSH_CONST  61
+       110  ARR_GET
+       111  JZ  172
+       113  LOAD_THIS
+       114  PUSH_CONST  50
+       116  ARR_GET
+       117  PUSH_CONST  1
+       119  ARR_GET
+       120  DUP
+       121  PUSH_CONST  130
+       123  ARR_GET
+       124  PUSH_CONST  131
+       126  CALL_METHOD  1
+       128  JMP  175
+       130  PUSH_CONST  132
+       132  ADD
+       133  CALL_VALUE  1
+       135  POP
+       136  PUSH_NULL
+       137  RET
+
+#28  $anon   <client>   (compiled as: _D1GFwfq)
+    identity client | params 2 | locals 2 | level weak
+    scope: [0] args (param), [1] reply (param)
+    bytecode:
+         0  LOAD_THIS
+         1  DUP
+         2  PUSH_CONST  134
+         4  ARR_GET
+         5  LOAD  1
+         7  CALL_METHOD  1
+         9  RET
+        10  PUSH_NULL
+        11  RET
+
+#29  $anon   <client>   (compiled as: _nDI7SVUvatO)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] name (param)
+    bytecode:
+         0  PUSH_CONST  45
+         2  LOAD  0
+         4  PUSH_CONST  89
+         6  PUSH_CONST  14
+         8  CALL_HOST  43, 1
+        11  PUSH_CONST  16
+        13  CALL_HOST  43, 1
+        16  PUSH_CONST  7
+        18  ARR_GET
+        19  ADD
+        20  PUSH_CONST  143
+        22  ADD
+        23  LOAD_THIS
+        24  PUSH_CONST  87
+        26  ARR_GET
+        27  LOAD  0
+        29  ARR_GET
+        30  PUSH_CONST  89
+        32  ARR_GET
+        33  ADD
+        34  PUSH_CONST  138
+        36  LOAD_THIS
+        37  PUSH_CONST  87
+        39  ARR_GET
+        40  LOAD  0
+        42  ARR_GET
+        43  PUSH_CONST  90
+        45  ARR_GET
+        46  NEW_OBJ  3
+        48  RET
+        49  PUSH_NULL
+        50  RET
+
+#30  $anon   <client>   (compiled as: _njurKjWRWrs)
+    identity client | params 2 | locals 5 | level weak
+    scope: [0] args (param), [1] reply (param), [2] action, [3] name, [4] index
+    bytecode:
+         0  LOAD  0
+         2  PUSH_CONST  7
+         4  ARR_GET
+         5  JNZ  20
+         7  PUSH_CONST  144
+         9  JNZ  20
+        11  PUSH_FALSE
+        12  JMP  21
+        14  PUSH_TRUE
+        15  DUP
+        16  PUSH_CONST  145
+        18  ARR_GET
+        19  CALL_METHOD  0
+        21  STORE  2
+        23  LOAD  0
+        25  PUSH_CONST  25
+        27  ARR_GET
+        28  STORE  3
+        30  LOAD  2
+        32  PUSH_CONST  144
+        34  EQ
+        35  JZ  106
+        37  LOAD  1
+        39  PUSH_CONST  72
+        41  PUSH_CONST  146
+        43  ADD
+        44  LOAD_THIS
+        45  PUSH_CONST  50
+        47  ARR_GET
+        48  PUSH_CONST  1
+        50  ARR_GET
+        51  PUSH_CONST  61
+        53  ARR_GET
+        54  JZ  99
+        56  LOAD_THIS
+        57  PUSH_CONST  50
+        59  ARR_GET
+        60  PUSH_CONST  1
+        62  ARR_GET
+        63  DUP
+        64  PUSH_CONST  130
+        66  ARR_GET
+        67  PUSH_CONST  131
+        69  CALL_METHOD  1
+        71  JMP  102
+        73  PUSH_CONST  132
+        75  ADD
+        76  CALL_VALUE  1
+        78  RET
+        79  LOAD  3
+        81  NOT
+        82  JZ  150
+        84  LOAD  1
+        86  PUSH_CONST  72
+        88  PUSH_CONST  147
+        90  ADD
+        91  PUSH_CONST  16
+        93  CALL_HOST  43, 1
+        96  PUSH_CONST  7
+        98  ARR_GET
+        99  ADD
+       100  PUSH_CONST  148
+       102  ADD
+       103  LOAD  2
+       105  ADD
+       106  PUSH_CONST  149
+       108  ADD
+       109  CALL_VALUE  1
+       111  RET
+       112  LOAD  2
+       114  PUSH_CONST  150
+       116  EQ
+       117  JZ  264
+       120  LOAD_THIS
+       121  PUSH_CONST  50
+       123  ARR_GET
+       124  PUSH_CONST  1
+       126  ARR_GET
+       127  DUP
+       128  PUSH_CONST  151
+       130  ARR_GET
+       131  LOAD  3
+       133  CALL_METHOD  1
+       135  JZ  199
+       137  LOAD  1
+       139  PUSH_CONST  72
+       141  LOAD  3
+       143  ADD
+       144  PUSH_CONST  152
+       146  ADD
+       147  CALL_VALUE  1
+       149  RET
+       150  LOAD_THIS
+       151  PUSH_CONST  50
+       153  ARR_GET
+       154  PUSH_CONST  1
+       156  ARR_GET
+       157  DUP
+       158  PUSH_CONST  68
+       160  ARR_GET
+       161  LOAD  3
+       163  CALL_METHOD  1
+       165  POP
+       166  LOAD  1
+       168  PUSH_CONST  72
+       170  PUSH_CONST  153
+       172  ADD
+       173  LOAD  3
+       175  ADD
+       176  PUSH_CONST  154
+       178  ADD
+       179  LOAD_THIS
+       180  PUSH_CONST  50
+       182  ARR_GET
+       183  PUSH_CONST  1
+       185  ARR_GET
+       186  DUP
+       187  PUSH_CONST  130
+       189  ARR_GET
+       190  PUSH_CONST  131
+       192  CALL_METHOD  1
+       194  ADD
+       195  PUSH_CONST  155
+       197  ADD
+       198  CALL_VALUE  1
+       200  RET
+       201  LOAD  2
+       203  PUSH_CONST  156
+       205  EQ
+       206  JZ  401
+       209  LOAD_THIS
+       210  PUSH_CONST  50
+       212  ARR_GET
+       213  PUSH_CONST  1
+       215  ARR_GET
+       216  DUP
+       217  PUSH_CONST  157
+       219  ARR_GET
+       220  LOAD  3
+       222  CALL_METHOD  1
+       224  STORE  4
+       226  LOAD  4
+       228  PUSH_CONST  158
+       230  EQ
+       231  JZ  323
+       234  LOAD  1
+       236  PUSH_CONST  72
+       238  LOAD  3
+       240  ADD
+       241  PUSH_CONST  159
+       243  ADD
+       244  CALL_VALUE  1
+       246  RET
+       247  LOAD_THIS
+       248  PUSH_CONST  50
+       250  ARR_GET
+       251  PUSH_CONST  1
+       253  ARR_GET
+       254  DUP
+       255  PUSH_CONST  160
+       257  ARR_GET
+       258  LOAD  4
+       260  PUSH_CONST  25
+       262  CALL_METHOD  2
+       264  POP
+       265  LOAD  1
+       267  LOAD_THIS
+       268  PUSH_CONST  50
+       270  ARR_GET
+       271  PUSH_CONST  1
+       273  ARR_GET
+       274  PUSH_CONST  61
+       276  ARR_GET
+       277  JZ  383
+       280  PUSH_CONST  72
+       282  PUSH_CONST  161
+       284  ADD
+       285  LOAD  3
+       287  ADD
+       288  PUSH_CONST  80
+       290  ADD
+       291  JMP  398
+       294  PUSH_CONST  72
+       296  PUSH_CONST  161
+       298  ADD
+       299  LOAD  3
+       301  ADD
+       302  PUSH_CONST  162
+       304  ADD
+       305  CALL_VALUE  1
+       307  RET
+       308  LOAD  1
+       310  PUSH_CONST  72
+       312  PUSH_CONST  147
+       314  ADD
+       315  PUSH_CONST  16
+       317  CALL_HOST  43, 1
+       320  PUSH_CONST  7
+       322  ARR_GET
+       323  ADD
+       324  PUSH_CONST  163
+       326  ADD
+       327  CALL_VALUE  1
+       329  RET
+       330  PUSH_NULL
+       331  RET
+
+#31  $anon   <client>   (compiled as: _zlMFIN2jMnA)
+    identity client | params 1 | locals 4 | level weak
+    scope: [0] reply (param), [1] __d4, [2] __d5, [3] entry
+    bytecode:
+         0  LOAD  0
+         2  PUSH_CONST  72
+         4  PUSH_CONST  15
+         6  ADD
+         7  PUSH_CONST  16
+         9  CALL_HOST  43, 1
+        12  PUSH_CONST  7
+        14  ARR_GET
+        15  ADD
+        16  PUSH_CONST  164
+        18  ADD
+        19  PUSH_CONST  140
+        21  CALL_HOST  43, 1
+        24  DUP
+        25  PUSH_CONST  141
+        27  ARR_GET
+        28  LOAD_THIS
+        29  PUSH_CONST  87
+        31  ARR_GET
+        32  CALL_METHOD  1
+        34  PUSH_CONST  61
+        36  ARR_GET
+        37  ADD
+        38  PUSH_CONST  165
+        40  ADD
+        41  PUSH_CONST  16
+        43  CALL_HOST  43, 1
+        46  DUP
+        47  PUSH_CONST  142
+        49  ARR_GET
+        50  CLOSURE  32
+        52  CALL_METHOD  1
+        54  DUP
+        55  PUSH_CONST  130
+        57  ARR_GET
+        58  PUSH_CONST  131
+        60  CALL_METHOD  1
+        62  ADD
+        63  PUSH_CONST  83
+        65  ADD
+        66  CALL_VALUE  1
+        68  POP
+        69  PUSH_CONST  140
+        71  CALL_HOST  43, 1
+        74  DUP
+        75  PUSH_CONST  166
+        77  ARR_GET
+        78  LOAD_THIS
+        79  PUSH_CONST  87
+        81  ARR_GET
+        82  CALL_METHOD  1
+        84  STORE  1
+        86  PUSH_CONST  7
+        88  STORE  2
+        90  LOAD  2
+        92  LOAD  1
+        94  CALL_HOST  56, 1
+        97  LT
+        98  JZ  211
+       100  LOAD  1
+       102  LOAD  2
+       104  ARR_GET
+       105  STORE  3
+       107  LOAD  0
+       109  PUSH_CONST  72
+       111  PUSH_CONST  167
+       113  ADD
+       114  PUSH_CONST  14
+       116  CALL_HOST  43, 1
+       119  ADD
+       120  PUSH_CONST  16
+       122  CALL_HOST  43, 1
+       125  PUSH_CONST  7
+       127  ARR_GET
+       128  ADD
+       129  PUSH_CONST  143
+       131  ADD
+       132  LOAD  3
+       134  PUSH_CONST  89
+       136  ARR_GET
+       137  ADD
+       138  PUSH_CONST  164
+       140  ADD
+       141  LOAD  3
+       143  PUSH_CONST  90
+       145  ARR_GET
+       146  ADD
+       147  CALL_VALUE  1
+       149  POP
+       150  LOAD  2
+       152  PUSH_CONST  25
+       154  ADD
+       155  STORE  2
+       157  JMP  117
+       159  LOAD  0
+       161  PUSH_CONST  72
+       163  PUSH_CONST  167
+       165  ADD
+       166  PUSH_CONST  14
+       168  CALL_HOST  43, 1
+       171  ADD
+       172  PUSH_CONST  16
+       174  CALL_HOST  43, 1
+       177  PUSH_CONST  7
+       179  ARR_GET
+       180  ADD
+       181  PUSH_CONST  168
+       183  ADD
+       184  CALL_VALUE  1
+       186  POP
+       187  PUSH_NULL
+       188  RET
+
+#32  $anon   <client>   (compiled as: _DJQFEda)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] n (param)
+    bytecode:
+         0  PUSH_CONST  14
+         2  CALL_HOST  43, 1
+         5  LOAD  0
+         7  ADD
+         8  RET
+         9  PUSH_NULL
+        10  RET
+
+#33  $anon   <client>   (compiled as: _bhYzoVYbaxu)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] username (param)
+    bytecode:
+         0  LOAD  0
+         2  PUSH_CONST  19
+         4  CALL_HOST  43, 1
+         7  EQ
+         8  JZ  16
+        10  PUSH_TRUE
+        11  RET
+        12  LOAD_THIS
+        13  PUSH_CONST  50
+        15  ARR_GET
+        16  PUSH_CONST  1
+        18  ARR_GET
+        19  PUSH_CONST  61
+        21  ARR_GET
+        22  PUSH_CONST  7
+        24  EQ
+        25  JZ  38
+        27  PUSH_TRUE
+        28  RET
+        29  LOAD_THIS
+        30  PUSH_CONST  50
+        32  ARR_GET
+        33  PUSH_CONST  1
+        35  ARR_GET
+        36  DUP
+        37  PUSH_CONST  151
+        39  ARR_GET
+        40  LOAD  0
+        42  CALL_METHOD  1
+        44  RET
+        45  PUSH_NULL
+        46  RET
+
+#34  $anon   <client>   (compiled as: _jdGzW5w)
+    identity client | params 3 | locals 7 | level weak | async
+    scope: [0] source (param), [1] username (param), [2] message (param), [3] parsed, [4] reply, [5] entry, [6] err
+    upvalues: _jhs1cPg12ru, _vJqjobyte
+    bytecode:
+         0  LOAD  1
+         2  NOT
+         3  JNZ  41
+         5  LOAD  0
+         7  PUSH_CONST  69
+         9  EQ
+        10  JZ  33
+        12  LOAD  1
+        14  LOAD_THIS
+        15  PUSH_CONST  48
+        17  ARR_GET
+        18  EQ
+        19  JZ  33
+        21  PUSH_TRUE
+        22  JMP  34
+        24  PUSH_FALSE
+        25  JNZ  41
+        27  PUSH_FALSE
+        28  JMP  42
+        30  PUSH_TRUE
+        31  JZ  53
+        33  PUSH_NULL
+        34  CLOSE_UPVALUE  1
+        36  CLOSE_UPVALUE  0
+        38  RET
+        39  LOAD  2
+        41  CALL  1, 1
+        44  STORE  3
+        46  LOAD  3
+        48  NOT
+        49  JZ  78
+        51  PUSH_NULL
+        52  CLOSE_UPVALUE  1
+        54  CLOSE_UPVALUE  0
+        56  RET
+        57  LOAD_THIS
+        58  DUP
+        59  PUSH_CONST  169
+        61  ARR_GET
+        62  LOAD  1
+        64  CALL_METHOD  1
+        66  NOT
+        67  JZ  101
+        69  PUSH_NULL
+        70  CLOSE_UPVALUE  1
+        72  CLOSE_UPVALUE  0
+        74  RET
+        75  CLOSURE  35
+        77  STORE  4
+        79  TRY  240
+        81  LOAD  3
+        83  PUSH_CONST  172
+        85  ARR_GET
+        86  NOT
+        87  JZ  141
+        89  LOAD_THIS
+        90  DUP
+        91  PUSH_CONST  77
+        93  ARR_GET
+        94  LOAD  4
+        96  PUSH_TRUE
+        97  CALL_METHOD  2
+        99  AWAIT
+       100  CLOSE_UPVALUE  1
+       102  CLOSE_UPVALUE  0
+       104  RET
+       105  LOAD_THIS
+       106  PUSH_CONST  87
+       108  ARR_GET
+       109  LOAD  3
+       111  PUSH_CONST  172
+       113  ARR_GET
+       114  ARR_GET
+       115  STORE  5
+       117  LOAD  5
+       119  NOT
+       120  JZ  207
+       122  LOAD  4
+       124  PUSH_CONST  72
+       126  PUSH_CONST  173
+       128  ADD
+       129  LOAD  3
+       131  PUSH_CONST  172
+       133  ARR_GET
+       134  ADD
+       135  PUSH_CONST  174
+       137  ADD
+       138  CALL_VALUE  1
+       140  POP
+       141  LOAD_THIS
+       142  DUP
+       143  PUSH_CONST  134
+       145  ARR_GET
+       146  LOAD  4
+       148  CALL_METHOD  1
+       150  CLOSE_UPVALUE  1
+       152  CLOSE_UPVALUE  0
+       154  RET
+       155  LOAD  5
+       157  DUP
+       158  PUSH_CONST  92
+       160  ARR_GET
+       161  LOAD  3
+       163  PUSH_CONST  175
+       165  ARR_GET
+       166  LOAD  4
+       168  LOAD  3
+       170  PUSH_CONST  176
+       172  ARR_GET
+       173  CALL_METHOD  3
+       175  AWAIT
+       176  POP
+       177  END_TRY
+       178  JMP  269
+       181  STORE  6
+       183  LOAD_UP  0
+       185  DUP
+       186  PUSH_CONST  71
+       188  ARR_GET
+       189  PUSH_CONST  72
+       191  PUSH_CONST  177
+       193  ADD
+       194  LOAD  6
+       196  PUSH_CONST  75
+       198  ARR_GET
+       199  ADD
+       200  CALL_METHOD  1
+       202  POP
+       203  PUSH_NULL
+       204  CLOSE_UPVALUE  1
+       206  CLOSE_UPVALUE  0
+       208  RET
+
+#35  $anon   <client>   (compiled as: _HN69Wp2)
+    identity client | params 1 | locals 1 | level weak
+    scope: [0] text (param)
+    upvalues: _flMJyvIF458, _TXupQ9ilk, _R9avypAr4, _rXop8ns
+    bytecode:
+         0  LOAD_UP  0
+         2  DUP
+         3  PUSH_CONST  71
+         5  ARR_GET
+         6  LOAD  0
+         8  CALL_METHOD  1
+        10  POP
+        11  LOAD_UP  1
+        13  PUSH_CONST  171
+        15  EQ
+        16  JZ  42
+        18  LOAD_UP  2
+        20  PUSH_CONST  19
+        22  CALL_HOST  43, 1
+        25  NEQ
+        26  JZ  42
+        28  PUSH_TRUE
+        29  JMP  43
+        31  PUSH_FALSE
+        32  JZ  62
+        34  LOAD_UP  2
+        36  LOAD_THIS
+        37  PUSH_CONST  48
+        39  ARR_GET
+        40  NEQ
+        41  JZ  62
+        43  PUSH_TRUE
+        44  JMP  63
+        46  PUSH_FALSE
+        47  JZ  93
+        49  LOAD_UP  3
+        51  DUP
+        52  PUSH_CONST  171
+        54  ARR_GET
+        55  LOAD_UP  2
+        57  LOAD  0
+        59  CALL_METHOD  2
+        61  DUP
+        62  PUSH_CONST  70
+        64  ARR_GET
+        65  CLOSURE  36
+        67  CALL_METHOD  1
+        69  POP
+        70  PUSH_NULL
+        71  CLOSE_UPVALUE  0
+        73  CLOSE_UPVALUE  1
+        75  RET
+
+#36  $anon   <client>   (compiled as: _bHCfmV6)
+    identity client | params 0 | locals 0 | level weak
+    scope: (none)
+    bytecode:
+         0  PUSH_NULL
+         1  RET
+
+#37  $anon   <client>   (compiled as: _vvKpirMP4Zu)
+    identity client | params 2 | locals 2 | level weak
+    scope: [0] username (param), [1] message (param)
+    bytecode:
+         0  LOAD_THIS
+         1  DUP
+         2  PUSH_CONST  170
+         4  ARR_GET
+         5  PUSH_CONST  69
+         7  LOAD  0
+         9  LOAD  1
+        11  CALL_METHOD  3
+        13  RET
+        14  PUSH_NULL
+        15  RET
+
+#38  $anon   <client>   (compiled as: _L961Sx2BMdk)
+    identity client | params 2 | locals 2 | level weak
+    scope: [0] username (param), [1] message (param)
+    bytecode:
+         0  LOAD_THIS
+         1  DUP
+         2  PUSH_CONST  170
+         4  ARR_GET
+         5  PUSH_CONST  171
+         7  LOAD  0
+         9  LOAD  1
+        11  CALL_METHOD  3
+        13  RET
+        14  PUSH_NULL
+        15  RET
+
+#39  $anon   <client>   (compiled as: _T16rWJobW)
+    identity client | params 2 | locals 2 | level weak | async
+    scope: [0] bot (param), [1] api (param)
+    bytecode:
+         0  PUSH_CONST  85
+         2  CALL_HOST  43, 1
+         5  LOAD_THIS
+         6  PUSH_CONST  54
+         8  ARR_GET
+         9  CALL_VALUE  1
+        11  POP
+        12  LOAD  1
+        14  DUP
+        15  PUSH_CONST  114
+        17  ARR_GET
+        18  PUSH_CONST  75
+        20  LOAD_THIS
+        21  PUSH_CONST  60
+        23  ARR_GET
+        24  CALL_METHOD  2
+        26  POP
+        27  LOAD  1
+        29  DUP
+        30  PUSH_CONST  114
+        32  ARR_GET
+        33  PUSH_CONST  69
+        35  LOAD_THIS
+        36  PUSH_CONST  178
+        38  ARR_GET
+        39  CALL_METHOD  2
+        41  POP
+        42  LOAD  1
+        44  DUP
+        45  PUSH_CONST  114
+        47  ARR_GET
+        48  PUSH_CONST  171
+        50  LOAD_THIS
+        51  PUSH_CONST  179
+        53  ARR_GET
+        54  CALL_METHOD  2
+        56  POP
+        57  LOAD_THIS
+        58  DUP
+        59  PUSH_CONST  55
+        61  ARR_GET
+        62  PUSH_NULL
+        63  CALL_METHOD  1
+        65  POP
+        66  LOAD  1
+        68  DUP
+        69  PUSH_CONST  71
+        71  ARR_GET
+        72  PUSH_CONST  185
+        74  CALL_METHOD  1
+        76  POP
+        77  PUSH_NULL
+        78  RET
+
+## Constant pool
+----------------------------------------------------------------
+  [0] "DEFAULTS"
+  [1] "owners"
+  [2] "command"
+  [3] "/balance"
+  [4] "timeout"
+  [5] 5000
+  [6] "poll"
+  [7] 0
+  [8] "announce"
+  [9] "__setglobal"
+  [10] "BALANCE_PATTERN"
+  [11] "balance"
+  [12] "i"
+  [13] "__regex"
+  [14] "PREFIX"
+  [15] "/"
+  [16] "NAMES"
+  [17] "bal"
+  [18] "money"
+  [19] "PANEL_SENDER"
+  [20] "@panel"
+  [21] "DESCRIPTION"
+  [22] "Read the bot's in-game balance."
+  [23] "DURATION_UNITS"
+  [24] "ms"
+  [25] 1
+  [26] "s"
+  [27] 1000
+  [28] "sec"
+  [29] "m"
+  [30] 60000
+  [31] "min"
+  [32] "h"
+  [33] 3600000
+  [34] "hr"
+  [35] "SUFFIXES"
+  [36] "k"
+  [37] 1000000
+  [38] "b"
+  [39] 1000000000
+  [40] "t"
+  [41] 1000000000000
+  [42] "module"
+  [43] "__getglobal"
+  [44] "exports"
+  [45] "name"
+  [46] "Balance"
+  [47] "onLoad"
+  [48] "selfName"
+  [49] "username"
+  [50] "settings"
+  [51] "__extend"
+  [52] "waiters"
+  [53] "lastBalance"
+  [54] "pollTimer"
+  [55] "settle"
+  [56] "len"
+  [57] "clearTimeout"
+  [58] "timer"
+  [59] "resolve"
+  [60] "onMessage"
+  [61] "length"
+  [62] "test"
+  [63] "split"
+  [64] "readBalance"
+  [65] "Promise"
+  [66] "setTimeout"
+  [67] "filter"
+  [68] "push"
+  [69] "chat"
+  [70] "catch"
+  [71] "log"
+  [72] ""
+  [73] "Could not send "
+  [74] ": "
+  [75] "message"
+  [76] "__new"
+  [77] "report"
+  [78] "No answer to "
+  [79] " within "
+  [80] "."
+  [81] "Balance: "
+  [82] " ("
+  [83] ")"
+  [84] "reschedulePoll"
+  [85] "clearInterval"
+  [86] "setInterval"
+  [87] "handlers"
+  [88] "now"
+  [89] "usage"
+  [90] "help"
+  [91] "Read the balance (same as bare /bal)."
+  [92] "run"
+  [93] "command <text>"
+  [94] "The command to send to the server."
+  [95] "Command is "
+  [96] ". Usage: /bal command </balance>"
+  [97] "Will send "
+  [98] "poll <x> <s|m|h> | poll off"
+  [99] "Log the balance on a timer."
+  [100] "Polling off."
+  [101] "Usage: /bal poll <x> <s|m|h>  or  /bal poll off"
+  [102] "Refusing to poll faster than every 5s."
+  [103] "Polling every "
+  [104] "timeout <x> <s|ms>"
+  [105] "How long to wait for the server's answer."
+  [106] "Usage: /bal timeout <x> <s|ms>"
+  [107] 250
+  [108] "Refusing a timeout under 250ms - no server answers that fast."
+  [109] "Timeout set to "
+  [110] "announce on|off"
+  [111] "Also say the balance in public chat."
+  [112] "Announce is "
+  [113] "on"
+  [114] "off"
+  [115] ". Usage: /bal announce on|off"
+  [116] "Announce "
+  [117] "owner"
+  [118] "owner add|remove|list [name]"
+  [119] "Who may run these commands (empty list = anyone)."
+  [120] "ownerCommand"
+  [121] "status"
+  [122] "Show current settings."
+  [123] "Balance: command "
+  [124] " | timeout "
+  [125] " | poll "
+  [126] " | announce "
+  [127] " | last "
+  [128] "unknown"
+  [129] " | owners: "
+  [130] "join"
+  [131] ", "
+  [132] "anyone"
+  [133] "List these commands."
+  [134] "helpCommand"
+  [135] "commands"
+  [136] "aliases"
+  [137] "slice"
+  [138] "description"
+  [139] "subcommands"
+  [140] "Object"
+  [141] "keys"
+  [142] "map"
+  [143] " "
+  [144] "list"
+  [145] "toLowerCase"
+  [146] "Owners: "
+  [147] "Usage: /"
+  [148] " owner "
+  [149] " <name>"
+  [150] "add"
+  [151] "includes"
+  [152] " is already an owner."
+  [153] "Added owner "
+  [154] ". Only "
+  [155] " may run these commands now."
+  [156] "remove"
+  [157] "indexOf"
+  [158] -1
+  [159] " is not an owner."
+  [160] "splice"
+  [161] "Removed "
+  [162] " - anyone may run these commands now."
+  [163] " owner add|remove|list [name]"
+  [164] " - "
+  [165] " subcommands (aliases: "
+  [166] "values"
+  [167] "  "
+  [168] " - read the balance"
+  [169] "allowed"
+  [170] "dispatch"
+  [171] "whisper"
+  [172] "sub"
+  [173] "Unknown subcommand \""
+  [174] "\"."
+  [175] "args"
+  [176] "rest"
+  [177] "Command failed: "
+  [178] "onChat"
+  [179] "onWhisper"
+  [180] "Balance ready - "
+  [181] " runs "
+  [182] ". Try "
+  [183] " help."
+  [184] "onUnload"
+  [185] "Balance stopped."
+  [186] "typeof"
+  [187] "string"
+  [188] "trim"
+  [189] "startsWith"
+  [190] "^(\\S+)(?:\\s+([\\s\\S]*))?$"
+  [191] "exec"
+  [192] 2
+  [193] "\\s+"
+  [194] "^(\\d+(?:\\.\\d+)?)(ms|sec|min|hr|[smh])?$"
+  [195] "Math"
+  [196] "round"
+  [197] "Number"
+  [198] "true"
+  [199] "yes"
+  [200] "enable"
+  [201] "enabled"
+  [202] "false"
+  [203] "no"
+  [204] "disable"
+  [205] "disabled"
+  [206] "String"
+  [207] "replace"
+  [208] "§[0-9a-fk-or]"
+  [209] "gi"
+  [210] "{"
+  [211] "["
+  [212] "JSON"
+  [213] "parse"
+  [214] "Array"
+  [215] "isArray"
+  [216] "object"
+  [217] "json"
+  [218] "text"
+  [219] "with"
+  [220] "extra"
+  [221] "(\\d[\\d,]*(?:\\.\\d+)?)\\s*([kmbt])?"
+  [222] ","
+  [223] "g"
+  [224] "isFinite"
+  [225] "T"
+  [226] "B"
+  [227] "M"
+  [228] "K"
+  [229] "abs"
+  [230] "toFixed"
+
+## Added code (what protection generated)
+----------------------------------------------------------------
+  obfuscation passes   +24 instructions total (flat/bogus/split/close-upvalue)
+
+  (no control-flow passes active - enable <@flat>/<@bogus>/<@split> or --flatten/--bogus/--split)
+
+  decoy functions      0 (enable with --dud or the aggressive profile)
+  symbol renaming      40 names -> opaque randoms
+  VM randomization     internal VM identifiers randomized + minified per build
+
+## Recognized bytecode patterns
+----------------------------------------------------------------
+  Hot adjacent-opcode sequences (fusion / opcode-randomization candidates).
+  fusion: off
+  top bigrams:
+     236x  PUSH_CONST ARR_GET
+     137x  PUSH_CONST PUSH_CONST
+      95x  DUP PUSH_CONST
+      83x  LOAD PUSH_CONST
+      80x  ARR_GET PUSH_CONST
+      79x  LOAD_THIS PUSH_CONST
+      72x  PUSH_CONST ADD   -> CONSTADD
+      67x  PUSH_CONST CALL_HOST
+      55x  ADD PUSH_CONST
+      45x  PUSH_NULL RET
+  top trigrams:
+      94x  DUP PUSH_CONST ARR_GET
+      76x  PUSH_CONST ARR_GET PUSH_CONST
+      71x  PUSH_CONST PUSH_CONST PUSH_CONST
+      56x  LOAD_THIS PUSH_CONST ARR_GET
+      40x  ADD PUSH_CONST ADD
+      38x  ARR_GET PUSH_CONST ARR_GET
+      36x  PUSH_CONST ARR_GET LOAD
+      34x  LOAD PUSH_CONST ARR_GET
+      28x  PUSH_CONST ARR_GET CALL_METHOD
+      23x  PUSH_CONST PUSH_CONST ADD
+
+## Statistics
+----------------------------------------------------------------
+  real functions      40
+  decoy functions     0
+  total instructions  2352  (24 added by obfuscation passes)
+  constants           231
+  image size          8968 bytes
+  checksum            0x12eae3  (+ 4 integrity domains)
